@@ -1,0 +1,30 @@
+gpu_plugin = "xenos"
+gpu_submission_timestamps = true
+present_painted_profile = true
+
+# --- build 60fps (2026-11-07): cvars del bench que ganaron ---
+vblank_per_swap = false
+vblank_per_swap_timeout_ms = 20
+texture_load_linear_direct = true
+gpu_force_msaa_1x_from_2x = true
+texture_load_cpu_direct = true
+texture_load_cpu_poll = true
+gpu_msaa_4x_alias_to_1x = true
+resolve_copy_to_texture = true
+resolve_skip_memory_after_copy = true
+texture_poll_write_hook = true
+texture_poll_hook_skip_hash = true
+wait_reg_mem_spin_us = 18000
+vsync_precise_spin_us = 300
+texture_poll_hook_dirty_rows = true
+shared_memory_cpu_upload = true
+vulkan_sparse_shared_memory = false
+vulkan_submit_min_interval_us = 2000
+cp_pin_core = 1
+cp_idle_spin_us = 300
+[log]
+to_file = true
+level = "debug"
+file_writer = true
+max_file_size_mb = 5
+max_files = 8

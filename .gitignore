@@ -1,0 +1,38 @@
+# Nothing derived from the game is ever committed: its files, the code generated from default.xex, and the
+# binaries built from that code.
+
+# --- Game files ---------------------------------------------------------------
+game/
+romfs/
+*.xex
+*.xexp
+*.iso
+*.bin
+*.nxpack
+*.nxidx
+
+# --- Generated from the game --------------------------------------------------
+generated/
+src/recompiler/generated/
+ghidra/
+
+# --- Build output -------------------------------------------------------------
+out/
+build/
+*.nro
+*.nacp
+*.elf
+*.o
+*.obj
+*.a
+*.log
+*.bak*
+
+# --- SDK dependencies (tools/fetch_thirdparty.py) ----------------------------
+tools/rexglue-sdk/thirdparty/*/
+
+# --- Tools --------------------------------------------------------------------
+__pycache__/
+*.pyc
+.vs/
+.vscode/
