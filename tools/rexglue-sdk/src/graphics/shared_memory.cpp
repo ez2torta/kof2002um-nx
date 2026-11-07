@@ -20,6 +20,8 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 
+extern "C" int32_t rex_diag_draw_window(void);  // vulkan/command_processor.cpp
+#include <cstdio>
 namespace rex::graphics {
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
@@ -262,6 +264,11 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   uint32_t end = start + length - 1;
   uint32_t page_first = start >> page_size_log2_;
   uint32_t page_last = end >> page_size_log2_;
+  {
+    if (rex_diag_draw_window() && start < 0x18300000u && end >= 0x18100000u) {
+      std::printf("[gw] gpu write %08X +%X\n", start, length);
+    }
+  }
 
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
@@ -270,6 +277,30 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   // Mark the range as valid (so pages are not reuploaded until modified by the
   // CPU) and watch it so the CPU can reuse it and this will be caught.
   MakeRangeValid(start, length, true);
+}
+
+bool SharedMemory::IsRangeGpuWritten(uint32_t start, uint32_t length) const {
+  if (length == 0 || start >= kBufferSize) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  const uint32_t block_first = page_first >> 6, block_last = page_last >> 6;
+  // Read without the lock: a stale bit only picks the slower GPU load path for one load.
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t bits = UINT64_MAX;
+    if (i == block_first) {
+      bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (system_page_flags_valid_and_gpu_written_[i] & bits) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,

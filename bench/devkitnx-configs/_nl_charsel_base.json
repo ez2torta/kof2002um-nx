@@ -1,0 +1,215 @@
+{
+ "name": "kof2002um-bench",
+ "switch_ip": "192.168.0.137",
+ "nxlink": "D:/Ports Swtch/devkitPro/tools/bin/nxlink.exe",
+ "nro": "../../kof2002um-nx/kof2002um-nx.nro",
+ "upload_path": "kof2002um-nx/kof2002um-nx-at2.nro",
+ "args": [
+  "--autotest=bench",
+  "--perf",
+  "--at-input=sdmc:/switch/kof2002um-nx/bench_input_vb.txt",
+  "--vblank_per_swap=false",
+  "--gpu_submission_timestamps=true",
+  "--at-exit-at-end",
+  "--at-exit-after=30000",
+  "--vblank_per_swap_timeout_ms=20",
+  "--at-clock=vblank",
+  "--at-seed=1"
+ ],
+ "timeout_total": 1200,
+ "budget_ms": 16.667,
+ "perf_from_mark": "match_start",
+ "expect": [
+  {
+   "mark": "boot",
+   "within": 240
+  },
+  {
+   "mark": "first_frame",
+   "within": 180
+  },
+  {
+   "mark": "match_start",
+   "within": 600
+  }
+ ],
+ "sysbotbase": {
+  "enabled": true,
+  "port": 6000,
+  "before_run": [],
+  "open_netloader": false,
+  "netloader_wait": 1.5,
+  "on_mark": {
+   "first_frame": [
+    {
+     "wait": 6
+    },
+    {
+     "screenshot": "sel00"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel01"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel02"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel03"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel04"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel05"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel06"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel07"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel08"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel09"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel10"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel11"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel12"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel13"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel14"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel15"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel16"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel17"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel18"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel19"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel20"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel21"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel22"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel23"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel24"
+    },
+    {
+     "wait": 0.6
+    },
+    {
+     "screenshot": "sel25"
+    },
+    {
+     "wait": 0.6
+    }
+   ],
+   "match_start": [
+    {
+     "wait": 3
+    },
+    {
+     "screenshot": "pelea"
+    }
+   ]
+  },
+  "on_finish": []
+ }
+}

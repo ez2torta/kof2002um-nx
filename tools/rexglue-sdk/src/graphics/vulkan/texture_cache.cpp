@@ -41,6 +41,7 @@ REXCVAR_DEFINE_BOOL(texture_load_batch, true, "GPU",
 REXCVAR_DEFINE_BOOL(texture_load_split_timing, false, "GPU",
                     "Diagnostic: time the batched copies (and their barriers) of texture loads as "
                     "gp_other instead of gp_tex_load, to split the load shader from the copy cost");
+extern "C" int32_t rex_diag_draw_window(void);  // command_processor.cpp (diag_draw_log)
 REXCVAR_DEFINE_BOOL(texture_load_nowait_diag, false, "GPU",
                     "Diagnostic (wrong results possible): the batched copies do not wait for the "
                     "earlier readers of the images, to measure the cost of that wait");
@@ -71,6 +72,11 @@ REXCVAR_DEFINE_BOOL(texture_load_cpu_poll, true, "GPU",
                     "With texture_load_cpu_direct: don't upload those textures' guest range to the "
                     "shared memory buffer (no page protection to re-arm); instead compare guest "
                     "memory with the copy last loaded on every request and reload what changed");
+REXCVAR_DEFINE_BOOL(texture_cpu_direct_zero_row_fallback, true, "GPU",
+                    "texture_load_cpu_direct: a one-row texture (palette 256x1) whose guest RAM "
+                    "is all zeros loads through the shared memory buffer instead, like vanilla "
+                    "(char select palettes read as zeros there and the screen went black, "
+                    "2026-11-07)");
 
 namespace {
 struct TexLoadClass {
@@ -1469,7 +1475,11 @@ bool VulkanTextureCache::LoadsBaseWithoutSharedMemory(const Texture& texture) co
   return vulkan_texture.cpu_direct() && !texture.base_written_by_gpu && !texture.key().tiled &&
          !texture.key().scaled_resolve &&
          (usage == VulkanTexture::Usage::kUndefined ||
-          usage == VulkanTexture::Usage::kGuestShaderSampled);
+          usage == VulkanTexture::Usage::kGuestShaderSampled) &&
+         // GPU data written before this texture existed (its watch never fired): only in the
+         // buffer, so the shared memory path must load it (char select palettes, 2026-11-07).
+         !shared_memory().IsRangeGpuWritten(uint32_t(texture.key().base_page) << 12,
+                                            texture.GetGuestBaseSize());
 }
 
 bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex load_shader) {
@@ -1492,7 +1502,21 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
         static_cast<uint32_t>(rex::align(texture.GetGuestBaseSize(), UINT32_C(16))));
     return false;
   };
-  // Data the GPU resolved into guest memory is only in the shared memory buffer.
+  // Data the GPU resolved into guest memory is only in the shared memory buffer. The watch only
+  // reports GPU writes made after the texture was created: earlier ones are in the page flags.
+  if (!texture.base_written_by_gpu &&
+      shared_memory().IsRangeGpuWritten(uint32_t(texture.key().base_page) << 12,
+                                        texture.GetGuestBaseSize())) {
+    static uint32_t gpu_written_found = 0;
+    if (gpu_written_found++ < 16) {
+      std::printf("[cpu] texture @%05X %ux%u was written by the GPU before: shared memory path\n",
+                  uint32_t(texture.key().base_page), texture.key().GetWidth(),
+                  texture.key().GetHeight());
+    }
+    texture.base_written_by_gpu = true;
+    texture.loaded_base_hash_valid = false;
+    texture.loaded_base_shadow_valid = false;
+  }
   VulkanTexture::Usage usage = vulkan_texture.usage();
   if (texture.base_written_by_gpu || (usage != VulkanTexture::Usage::kUndefined &&
                                       usage != VulkanTexture::Usage::kGuestShaderSampled)) {
@@ -1517,6 +1541,27 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
       shared_memory().guest_memory().TranslatePhysical(uint32_t(key.base_page) << 12);
   if (!src) {
     return fallback();
+  }
+  // Palettes that read as zeros in guest RAM still have data in the shared memory buffer (char
+  // select, cause unknown): load those like vanilla. Non-zero palettes (fights) stay on the CPU.
+  if (height == 1 && REXCVAR_GET(texture_cpu_direct_zero_row_fallback)) {
+    bool all_zero = true;
+    for (uint32_t i = 0; i < row_bytes; i += 8) {
+      uint64_t v = 0;
+      std::memcpy(&v, src + i, std::min<uint32_t>(8, row_bytes - i));
+      if (v) {
+        all_zero = false;
+        break;
+      }
+    }
+    if (all_zero) {
+      static uint32_t zero_row_fallbacks = 0;
+      if (zero_row_fallbacks++ < 8) {
+        std::printf("[cpu] zero palette @%05X %ux1: shared memory path\n",
+                    uint32_t(key.base_page), width);
+      }
+      return fallback();
+    }
   }
   // The first load goes into the untouched PREINITIALIZED image. Later ones write the current
   // version in place if no draw recorded or in flight reads it any more (the game waits for the
@@ -1631,6 +1676,19 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
         VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_PREINITIALIZED,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     vulkan_texture.SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
+  }
+  {
+    if (rex_diag_draw_window()) {
+      uint32_t nz = 0;
+      for (uint32_t y = row_first; y < row_end; ++y) {
+        const uint8_t* s = src + size_t(y) * guest_row_pitch;
+        for (uint32_t x = 0; x < row_bytes; ++x) nz += s[x] != 0;
+      }
+      std::printf("[dl] f%u @%05X %ux%u lf%u rows %u-%u cp%u nz%u trans%u gen%llu partial%u\n",
+                  g_texture_poll_frame, uint32_t(key.base_page), width, height,
+                  uint32_t(load_shader), row_first, row_end, rows_copied, nz,
+                  uint32_t(needs_transition), (unsigned long long)new_gen, uint32_t(partial));
+    }
   }
   ++cpu_loads;
   cpu_bytes += uint64_t(row_bytes) * rows_copied;

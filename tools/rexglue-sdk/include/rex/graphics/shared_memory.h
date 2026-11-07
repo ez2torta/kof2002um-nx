@@ -95,6 +95,10 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Whether any page of the range holds data the GPU wrote (resolve, memexport) and the CPU has
+  // not overwritten since: guest RAM does not have it, only the buffer (texture_load_cpu_direct).
+  bool IsRangeGpuWritten(uint32_t start, uint32_t length) const;
+
   // Guest RAM, for CPU-side checks of a range (texture_skip_unchanged_reload).
   memory::Memory& guest_memory() const { return memory_; }
 

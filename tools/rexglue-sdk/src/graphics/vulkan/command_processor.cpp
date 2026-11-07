@@ -66,6 +66,19 @@ REXCVAR_DEFINE_INT32(perf_skip_mask, 0, "GPU",
 extern "C" void RexSwitchPerfSetFixedSkip(unsigned mask);
 #endif
 
+REXCVAR_DEFINE_INT32(diag_draw_log_from, -1, "GPU",
+                     "Diagnostic: printf one [dd] line per draw from this frame (g_texture_poll_frame). "
+                     "-1 = off");
+REXCVAR_DEFINE_INT32(diag_draw_log_to, -1, "GPU", "Diagnostic: last frame of diag_draw_log_from");
+REXCVAR_DEFINE_INT32(diag_draw_log_step, 1, "GPU",
+                     "Diagnostic: only every Nth frame inside the diag_draw_log range");
+// texture_cache.cpp diagnostics: inside the diag_draw_log frame range (every frame).
+extern "C" int32_t rex_diag_draw_window(void) {
+  const int32_t from = REXCVAR_GET(diag_draw_log_from);
+  const uint32_t fr = rex::graphics::g_texture_poll_frame;
+  return from >= 0 && fr >= uint32_t(from) && fr <= uint32_t(REXCVAR_GET(diag_draw_log_to));
+}
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -5024,7 +5037,97 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
+  // diag_draw_log: one line per draw, printed on any return, with the last stage reached.
+  struct DrawDiag {
+    const RegisterFile* regs = nullptr;
+    decltype(memory_) mem = nullptr;
+    const char* stage = "start";
+    uint32_t prim = 0, count = 0, host_count = 0;
+    uint64_t vs = 0, ps = 0;
+    uint32_t tex_mask = 0, color_mask = 0;
+    ~DrawDiag() {
+      if (!regs) return;
+      const RegisterFile& r = *regs;
+      auto ci = r.Get<reg::RB_COLOR_INFO>();
+      auto si = r.Get<reg::RB_SURFACE_INFO>();
+      auto mc = r.Get<reg::RB_MODECONTROL>();
+      auto dc = r.Get<reg::RB_DEPTHCONTROL>();
+      char tex[256];
+      int n = 0;
+      tex[0] = 0;
+      uint32_t m = tex_mask, idx;
+      while (m && n < 200 && rex::bit_scan_forward(m, &idx)) {
+        m &= ~(UINT32_C(1) << idx);
+        xenos::xe_gpu_texture_fetch_t f = r.GetTextureFetch(idx);
+        n += snprintf(tex + n, sizeof(tex) - n, " t%u:f%u %ux%u @%05X%s d%u", idx,
+                      uint32_t(f.format), f.size_2d.width + 1, f.size_2d.height + 1,
+                      uint32_t(f.base_address), f.tiled ? "T" : "L", uint32_t(f.dimension));
+        if (mem && !f.tiled && f.base_address) {
+          const uint8_t* p = mem->template TranslatePhysical<const uint8_t*>(
+              uint32_t(f.base_address) << 12);
+          if (f.size_2d.height == 0) {
+            const uint32_t* d = reinterpret_cast<const uint32_t*>(p);
+            uint32_t w = f.size_2d.width + 1, nzc = 0, orv = 0, h = 0;
+            for (uint32_t k = 0; k < w; ++k) {
+              nzc += d[k] != 0;
+              orv |= d[k];
+              h = h * 31 + d[k];
+            }
+            n += snprintf(tex + n, sizeof(tex) - n, " [pnz%u or%08X h%08X]", nzc, orv, h);
+          } else if (uint32_t(f.format) == 2) {
+            uint32_t sum = 0, nz = 0;
+            uint32_t sz = (f.size_2d.width + 1) * (f.size_2d.height + 1);
+            for (uint32_t k = 0; k < sz; ++k) {
+              sum = sum * 31 + p[k];
+              nz += p[k] != 0;
+            }
+            n += snprintf(tex + n, sizeof(tex) - n, " [sum%08X nz%u]", sum, nz);
+          }
+        }
+      }
+      printf("[dd] f%u %s p%u n%u h%u vs%016llX ps%016llX em%u cf%u cb%05X pitch%u msaa%u cm%X z%X "
+             "blend%08X%s\n",
+             g_texture_poll_frame, stage, prim, count, host_count, (unsigned long long)vs,
+             (unsigned long long)ps, uint32_t(mc.edram_mode), uint32_t(ci.color_format),
+             uint32_t(ci.color_base), uint32_t(si.surface_pitch), uint32_t(si.msaa_samples),
+             color_mask, dc.value, r[reg::RB_BLENDCONTROL::rt_register_indices[0]], tex);
+      if (mc.edram_mode != xenos::EdramMode::kCopy && ps) {
+        float vp[6];
+        for (int k = 0; k < 6; ++k) {
+          uint32_t v = r[XE_GPU_REG_PA_CL_VPORT_XSCALE + k];
+          std::memcpy(&vp[k], &v, 4);
+        }
+        printf("[dd]   cc%08X aref%08X vte%08X wtl%08X wbr%08X sctl%08X sbr%08X vp %.1f %.1f %.1f "
+               "%.1f\n",
+               r[XE_GPU_REG_RB_COLORCONTROL], r[XE_GPU_REG_RB_ALPHA_REF],
+               r[XE_GPU_REG_PA_CL_VTE_CNTL], r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+               r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], r[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL],
+               r[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR], vp[0], vp[1], vp[2], vp[3]);
+      }
+      if (mc.edram_mode == xenos::EdramMode::kCopy) {
+        printf("[dd]   copy ctl%08X dst%08X info%08X pitch%08X clr%08X wtl%08X wbr%08X woff%08X "
+               "sctl%08X\n",
+               r[XE_GPU_REG_RB_COPY_CONTROL], r[XE_GPU_REG_RB_COPY_DEST_BASE],
+               r[XE_GPU_REG_RB_COPY_DEST_INFO], r[XE_GPU_REG_RB_COPY_DEST_PITCH],
+               r[XE_GPU_REG_RB_COLOR_CLEAR], r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+               r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], r[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+               r[XE_GPU_REG_RB_SURFACE_INFO]);
+      }
+    }
+  } ddiag;
+  {
+    int32_t from = REXCVAR_GET(diag_draw_log_from);
+    uint32_t fr = g_texture_poll_frame;
+    if (from >= 0 && fr >= uint32_t(from) && fr <= uint32_t(REXCVAR_GET(diag_draw_log_to)) &&
+        ((fr - uint32_t(from)) % uint32_t(std::max(1, REXCVAR_GET(diag_draw_log_step)))) == 0) {
+      ddiag.regs = &regs;
+      ddiag.mem = memory_;
+      ddiag.prim = uint32_t(prim_type);
+      ddiag.count = index_count;
+    }
+  }
   auto draw_fail = [&](const char* stage) {
+    ddiag.stage = stage;
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
     REXGPU_ERROR(
         "Vulkan IssueDraw failed at {} "
@@ -5041,6 +5144,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
+    ddiag.stage = "copy";
     return IssueCopy();
   }
 
@@ -5057,6 +5161,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return draw_fail("missing_vertex_shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  ddiag.vs = vertex_shader->ucode_data_hash();
+  ddiag.stage = "pitch0";
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -5092,11 +5198,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   } else {
     // Disabling pixel shader for this case is also required by the pipeline
     // cache.
+    ddiag.stage = "no_raster";
     if (!memexport_used_vertex) {
       // This draw has no effect.
       return true;
     }
   }
+  if (pixel_shader) ddiag.ps = pixel_shader->ucode_data_hash();
+  ddiag.stage = is_rasterization_done ? (pixel_shader ? "prim" : "prim_nops") : "prim_noraster";
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   if (memexport_used_pixel) {
     if (!device_properties.fragmentStoresAndAtomics) {
@@ -5144,7 +5253,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (!primitive_processor_->Process(primitive_processing_result)) {
       return draw_fail("primitive_processing");
     }
+    ddiag.host_count = primitive_processing_result.host_draw_vertex_count;
     if (!primitive_processing_result.host_draw_vertex_count) {
+      ddiag.stage = "zero_verts";
       // Nothing to draw.
       return true;
     }
@@ -5272,6 +5383,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  ddiag.tex_mask = pixel_shader ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0;
+  ddiag.color_mask = normalized_color_mask;
+  ddiag.stage = "rt_pipe";
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
@@ -5298,12 +5412,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
+    ddiag.stage = "placeholder";
     frame_used_async_placeholder_pipeline_ = true;
     return true;
   }
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
     return draw_fail("pipeline_lookup");
   }
+  ddiag.stage = "bind";
   if (current_guest_graphics_pipeline_ != pipeline) {
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     current_guest_graphics_pipeline_ = pipeline;
@@ -5618,6 +5734,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                               0, 0, 0);
   }
 
+  ddiag.stage = "ok";
   // Invalidate textures in memexported memory and watch for changes.
   if (!memexport_ranges_.empty()) {
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
