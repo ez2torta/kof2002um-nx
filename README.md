@@ -8,7 +8,8 @@ drawn through a Vulkan backend running on NVK (Mesa).
 
 > [!NOTE]
 > This repository contains **no game data and no code derived from the game**. You need your own copy of the
-> Xbox 360 game (the XBLA package).
+> Xbox 360 game (the XBLA package). The [installer page](https://tbittech.github.io/kof2002um-nx-installer/) turns
+> it into the files the Switch needs.
 
 ## Status
 
@@ -45,6 +46,10 @@ See [PORT_STATUS.md](PORT_STATUS.md) for the detailed log: newest section first.
 
 ## Install on the Switch
 
+The easiest way is the **installer page: <https://tbittech.github.io/kof2002um-nx-installer/>**. Give it your XBLA
+package (or the folder extracted from it) and it builds `kof2002um-nx.zip` with the NRO, the `.toml` and the game
+files, all inside your browser: your copy is never uploaded. Unzip it into `sdmc:/switch/`, which leaves:
+
 ```text
 /switch/kof2002um-nx/
   kof2002um-nx.nro
@@ -61,3 +66,9 @@ does not provide enough memory.
   project, whose GPU and kernel code the runtime derives from.
 - [nfsmw-nx](https://github.com/StevensND/nfsmw-nx), another ReXGlue port to the Switch.
 - devkitPro, libnx and Mesa/NVK.
+
+## Support
+
+If you enjoy my work and want to support me:
+
+<a href="https://tecito.app/tebit"><img src="https://img.shields.io/badge/Support_me_on-tecito-6d4aff?style=for-the-badge" alt="Support me on tecito" height="32"></a>
