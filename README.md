@@ -17,8 +17,10 @@ En desarrollo. En dock, con los relojes de fábrica de la consola y sin overcloc
 memoria 1600 MHz), una pelea completa va a ~52–56 FPS (el objetivo son 60 estables). Por debajo de 60 el juego va
 un poco más lento de lo normal, porque su lógica avanza un paso por cada cuadro dibujado.
 
-**Problemas conocidos:** en la pantalla de selección de personajes no se dibuja la grilla de personajes (el cursor y
-la selección funcionan igual). El modo portátil todavía no se midió.
+**Problemas conocidos:** el modo portátil todavía no se midió.
+
+**Arreglado (2026-11-07):** la pantalla de selección de personajes salía negra (sin grilla, fondo ni cursores), y
+faltaban el fondo y la interfaz de la pantalla de orden. Ahora se ven bien, sin costo de rendimiento en la pelea.
 
 El registro detallado está en [PORT_STATUS.md](PORT_STATUS.md) (lo más nuevo arriba).
 
