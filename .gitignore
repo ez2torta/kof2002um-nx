@@ -36,3 +36,6 @@ __pycache__/
 *.pyc
 .vs/
 .vscode/
+
+# --- Release-only binaries ----------------------------------------------------
+*.nsp
