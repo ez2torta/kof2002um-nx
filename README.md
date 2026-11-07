@@ -12,9 +12,13 @@ drawn through a Vulkan backend running on NVK (Mesa).
 
 ## Status
 
-Work in progress. In dock, a full fight runs at ~52–56 FPS (the target is a stable 60). Below 60 the game runs
-slightly slower than normal, because its logic advances one step per drawn frame. See
-[PORT_STATUS.md](PORT_STATUS.md) for the detailed log: newest section first.
+Work in progress. In dock, at the console's stock clocks with no overclock (CPU 1020 MHz, GPU 768 MHz, memory
+1600 MHz), a full fight runs at ~52–56 FPS (the target is a stable 60). Below 60 the game runs
+slightly slower than normal, because its logic advances one step per drawn frame. 
+**Known issues:** on the character select screen the character grid is not drawn (the cursor and the selection
+still work). Handheld mode has not been measured yet.
+
+See [PORT_STATUS.md](PORT_STATUS.md) for the detailed log: newest section first.
 
 ## Layout
 
