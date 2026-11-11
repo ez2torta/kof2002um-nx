@@ -1,6 +1,6 @@
 # Rendimiento en portátil sin overclock: hallazgos y plan
 
-Documento de trabajo de la sesión del 2026-11-11. Reúne lo medido, lo descartado, el estado del código y el plan de
+Documento de trabajo de la sesión del 2026-11-11. Para el camino de fondo (renderer propio) ver `docs/RENDERER_DESIGN.md`. Reúne lo medido, lo descartado, el estado del código y el plan de
 cambios para llegar a 60 fps estables en portátil con los relojes de fábrica (CPU 1020 / GPU 460,8 / EMC 1331 MHz)
 y, más adelante, a un costo de 6–8 ms por frame con un renderer propio.
 
@@ -41,6 +41,15 @@ casi ninguno entre medio.
 - `CP per frame`: ms del hilo de comandos (ocioso, espera de fence, submit, texturas, `WAIT_REG_MEM`) y conteos por frame.
 - `render pass ends per frame by caller`: cuántas veces corta cada llamador un render pass (direcciones `image+0x…`).
 - `heap:` línea de heap (ventana, break de sbrk, arena, en uso, libre, fragmentos).
+- `stage background: bgXn.bin`: último fondo de etapa que abrió el juego (`data\B\bg\bgXn.bin`), para etiquetar cada ventana.
+  Se captura aparte del log `[KOF data I/O]`, que solo cubre las primeras 96 aperturas de archivo.
+- `barriers pushed per frame by caller`: quién empuja las barreras pendientes (`i` = imagen, `b` = buffer), por dirección `image+0x…`.
+- `texture loads per frame by path`: cuántas cargas de textura van por la carga directa por CPU y cuántas caen al camino de GPU,
+  con el motivo (`gpu-written`, `format`, `tiled`, `layout`, `no-source`, `zero-palette`, `no-free-version`, `not-eligible`, `mips`,
+  `no-base`) y las texturas que no entran por el camino rápido (formato, tamaño, tiled o lineal).
+- `CPU texture copies: N MB per frame`: bytes que copia el CPU a texturas por frame.
+- `resolves copied straight into a texture`: resolves por frame, y cuántos usan el blit con intercambio rojo/azul.
+- Los logs `[rtt] resolve -> …` (resolve directo a textura) ahora también van al log de archivo.
 - Con `switch_profile_stacks = true`: muestreo de pc y pila a 1 kHz por hilo (frena el juego; solo para medir).
 
 ### 2.2 Log por draw
