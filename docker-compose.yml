@@ -1,0 +1,35 @@
+# docker compose build            -> construye la imagen del toolchain
+# docker compose run --rm codegen  -> compila el rexglue del SDK del repo y hace el codegen de default.xex (Debian 13)
+# docker compose run --rm nx       -> fetch + configure + build (deja kof2002um-nx.nro en la raíz del repo)
+# docker compose run --rm nx fetch | configure | build | shell
+services:
+  codegen:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: codegen
+    image: kof2002um-nx-codegen:latest
+    environment:
+      GAME_DIR: /game
+      JOBS: ${JOBS:-4}
+      # REXGLUE_BIN: /rexglue/bin/rexglue   # opcional: rexglue precompilado (ojo: el 0.10.0 estándar no entiende parent/share_registers del manifiesto)
+    volumes:
+      - .:/work
+      - ./docker/build.sh:/usr/local/bin/kof-build:ro
+      - ${GAME_DIR:-/media/sda1/Games/x360recomp/extracted/kof2002um}:/game:ro
+  nx:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: toolchain
+    image: kof2002um-nx-build:latest
+    environment:
+      GAME_DIR: /game
+      NVK_SDK: /mesa-sdk/opt/devkitpro/portlibs/switch
+      JOBS: ${JOBS:-4}          # la RAM manda: cada TU recompilada es pesada
+    volumes:
+      - .:/work
+      - ./docker/build.sh:/usr/local/bin/kof-build:ro
+      - ${GAME_DIR:-/media/sda1/Games/x360recomp/extracted/kof2002um}:/game:ro
+      - ${MESA_SDK:-./tools/mesa-switch-sdk}:/mesa-sdk/opt/devkitpro/portlibs/switch:ro
+      - ${REXGLUE_DIR:-/media/sda1/Games/x360recomp/tools/rexglue/linux-amd64}:/rexglue:ro
