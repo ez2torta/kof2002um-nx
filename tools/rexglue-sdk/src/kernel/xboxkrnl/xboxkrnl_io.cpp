@@ -79,6 +79,7 @@ struct CountersIo {
 CountersIo g_io;
 std::atomic<uint32_t> g_io_warnings{0};
 std::atomic<uint64_t> g_io_next_summary{0};
+extern "C" void rex_note_stage_file(const char* path);  // core/autotest.cpp
 std::atomic<uint32_t> g_kof_data_io_logs{0};
 
 /*
@@ -505,6 +506,17 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
     // Handle ref is incremented, so return that.
     handle = file->handle();
+    {
+      // Stage background (data\\B\\bg\\bgXn.bin): remembered for the profile report, not subject to the log cap.
+      std::string lower = target_path;
+      for (char& c : lower) {
+        c = char(std::tolower(static_cast<unsigned char>(c)));
+      }
+      if (lower.find("\\bg\\bg") != std::string::npos && lower.size() > 4 &&
+          lower.compare(lower.size() - 4, 4, ".bin") == 0) {
+        rex_note_stage_file(target_path.c_str());
+      }
+    }
     if (target_path.find("\\data\\") != std::string::npos &&
         g_kof_data_io_logs.fetch_add(1, std::memory_order_relaxed) < 96) {
       REXLOG_INFO("[KOF data I/O] open path='{}' size={:#x} handle={:#x}", target_path,

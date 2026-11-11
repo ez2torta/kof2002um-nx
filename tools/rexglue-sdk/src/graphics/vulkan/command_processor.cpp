@@ -174,6 +174,35 @@ void NoteRenderPassEnd(uintptr_t site) {
   }
 }
 }  // namespace
+// Pending barriers by pushing call site (return address; bit 0 set = buffer barrier, clear = image barrier), same
+// idea as the render pass table above: tells which code asks for the barriers that cut the render passes.
+namespace {
+RpSite g_bar_sites[32];
+uint32_t g_bar_site_count = 0;
+std::mutex g_bar_mutex;
+void NoteBarrierPush(uintptr_t site) {
+  std::lock_guard<std::mutex> lock(g_bar_mutex);
+  for (uint32_t i = 0; i < g_bar_site_count; ++i) {
+    if (g_bar_sites[i].addr == site) {
+      ++g_bar_sites[i].count;
+      return;
+    }
+  }
+  if (g_bar_site_count < 32) {
+    g_bar_sites[g_bar_site_count++] = {site, 1};
+  }
+}
+}  // namespace
+extern "C" uint32_t rex_cp_take_barrier_sites(uint64_t* out, uint32_t cap_pairs) {
+  std::lock_guard<std::mutex> lock(g_bar_mutex);
+  const uint32_t n = std::min(g_bar_site_count, cap_pairs);
+  for (uint32_t i = 0; i < n; ++i) {
+    out[2 * i] = g_bar_sites[i].addr;
+    out[2 * i + 1] = g_bar_sites[i].count;
+  }
+  g_bar_site_count = 0;
+  return n;
+}
 extern "C" uint32_t rex_cp_take_rp_sites(uint64_t* out, uint32_t cap_pairs) {
   std::lock_guard<std::mutex> lock(g_rp_mutex);
   const uint32_t n = std::min(g_rp_site_count, cap_pairs);
@@ -4428,11 +4457,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   EndSubmission(true);
 }
 
-bool VulkanCommandProcessor::PushBufferMemoryBarrier(
+__attribute__((noinline)) bool VulkanCommandProcessor::PushBufferMemoryBarrier(
     VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, VkPipelineStageFlags src_stage_mask,
     VkPipelineStageFlags dst_stage_mask, VkAccessFlags src_access_mask,
     VkAccessFlags dst_access_mask, uint32_t src_queue_family_index, uint32_t dst_queue_family_index,
     bool skip_if_equal) {
+  NoteBarrierPush(reinterpret_cast<uintptr_t>(__builtin_return_address(0)) | 1);
   if (skip_if_equal && src_stage_mask == dst_stage_mask && src_access_mask == dst_access_mask &&
       src_queue_family_index == dst_queue_family_index) {
     return false;
@@ -4478,12 +4508,13 @@ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
   return true;
 }
 
-bool VulkanCommandProcessor::PushImageMemoryBarrier(
+__attribute__((noinline)) bool VulkanCommandProcessor::PushImageMemoryBarrier(
     VkImage image, const VkImageSubresourceRange& subresource_range,
     VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
     VkAccessFlags src_access_mask, VkAccessFlags dst_access_mask, VkImageLayout old_layout,
     VkImageLayout new_layout, uint32_t src_queue_family_index, uint32_t dst_queue_family_index,
     bool skip_if_equal) {
+  NoteBarrierPush(reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
   if (skip_if_equal && src_stage_mask == dst_stage_mask && src_access_mask == dst_access_mask &&
       old_layout == new_layout && src_queue_family_index == dst_queue_family_index) {
     return false;

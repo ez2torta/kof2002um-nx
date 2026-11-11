@@ -22,6 +22,7 @@
 #include <rex/autotest.h>
 
 #include <atomic>
+#include <mutex>
 #include <cstring>
 
 namespace {
@@ -114,6 +115,28 @@ extern "C" void rex_autotest_gpu_passes(const uint64_t* ns, uint32_t count, uint
   }
   g_gpu_pass_markers.store(markers, std::memory_order_relaxed);
   g_gpu_passes_seen.store(true, std::memory_order_relaxed);
+}
+
+// Name of the last stage background file the game opened (data\\B\\bg\\bgXn.bin), for the profile report. Kept apart
+// from the "[KOF data I/O]" log, which only covers the first 96 opens.
+namespace {
+std::mutex g_stage_mutex;
+char g_stage_name[40] = "";
+}  // namespace
+extern "C" void rex_note_stage_file(const char* path) {
+  if (path == nullptr) {
+    return;
+  }
+  const char* name = std::strrchr(path, '\\');
+  name = name ? name + 1 : path;
+  std::lock_guard<std::mutex> lock(g_stage_mutex);
+  std::strncpy(g_stage_name, name, sizeof(g_stage_name) - 1);
+  g_stage_name[sizeof(g_stage_name) - 1] = '\0';
+}
+extern "C" void rex_take_stage_name(char* out, uint32_t cap) {
+  std::lock_guard<std::mutex> lock(g_stage_mutex);
+  std::strncpy(out, g_stage_name, cap - 1);
+  out[cap - 1] = '\0';
 }
 
 // Profile report (switch_perf.cpp, every 10 s): takes and zeroes the interval accumulators.

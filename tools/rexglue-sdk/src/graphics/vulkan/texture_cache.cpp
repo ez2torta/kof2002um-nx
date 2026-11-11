@@ -11,6 +11,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <vector>
+#include <cstdio>
 #include <array>
 #include <cstddef>
 #include <cstring>
@@ -105,6 +110,66 @@ extern "C" void RexResolveStatsTextureLoad(uint32_t base, uint32_t size, uint32_
 // core/autotest.cpp: CPU time per frame for the cp_* zones (3 = cp_tex).
 extern "C" void rex_autotest_cpu_add(uint32_t zone, uint64_t ns);
 #include <chrono>
+#endif
+
+#if REX_PLATFORM_SWITCH
+// Texture load paths for the on-console report: which loads take the direct CPU path and which fall back to the
+// GPU (compute + shared memory) path, with the reason and the texture. Written by the command processor thread, taken
+// by the report thread every 10 s.
+namespace {
+enum TexPath : uint32_t {
+  kPathCpu = 0,
+  kPathGpuWritten,    // the GPU wrote the memory (resolve) or the texture was used another way
+  kPathFormat,        // not 8/16/32 bits per texel (compressed or packed formats)
+  kPathTiled,         // tiled guest layout
+  kPathLayout,        // pitch / size / endianness do not fit
+  kPathNoSource,
+  kPathZeroPalette,
+  kPathNoFreeVersion,
+  kPathNotEligible,   // the texture was not created for the direct path
+  kPathMips,          // load includes mip levels
+  kPathNoBase,
+  kPathCount
+};
+const char* const kTexPathNames[kPathCount] = {"cpu-direct", "gpu-written", "format", "tiled", "layout", "no-source",
+                                               "zero-palette", "no-free-version", "not-eligible", "mips", "no-base"};
+std::mutex g_texpath_mutex;
+std::map<uint64_t, uint32_t> g_texpath_counts;  // packed (path, format, tiled, dimension, w, h) -> loads
+uint32_t g_texpath_total[kPathCount];
+void NoteTexPath(uint32_t path, uint32_t format, bool tiled, uint32_t dimension, uint32_t w, uint32_t h) {
+  const uint64_t k = (uint64_t(path) << 56) | (uint64_t(format & 0x3F) << 48) | (uint64_t(tiled) << 47) |
+                     (uint64_t(dimension & 3) << 45) | (uint64_t(w & 0x1FFF) << 16) | (uint64_t(h & 0x1FFF));
+  std::lock_guard<std::mutex> lock(g_texpath_mutex);
+  ++g_texpath_counts[k];
+  ++g_texpath_total[path];
+}
+}  // namespace
+// Fills out with "path xN/frame ..." for the totals and the textures that do not take the CPU path, and zeroes them.
+extern "C" void rex_tex_take_path_stats(char* out, uint32_t cap, double frames) {
+  std::lock_guard<std::mutex> lock(g_texpath_mutex);
+  uint32_t n = 0;
+  auto add = [&](const char* fmt, auto... args) {
+    if (n < cap) n += uint32_t(snprintf(out + n, cap - n, fmt, args...));
+  };
+  out[0] = '\0';
+  add("by path:");
+  for (uint32_t i = 0; i < kPathCount; ++i) {
+    if (g_texpath_total[i]) add(" %s x%.1f", kTexPathNames[i], double(g_texpath_total[i]) / frames);
+  }
+  std::vector<std::pair<uint32_t, uint64_t>> slow;
+  for (auto& e : g_texpath_counts) {
+    if ((e.first >> 56) != kPathCpu) slow.emplace_back(e.second, e.first);
+  }
+  std::sort(slow.begin(), slow.end(), [](auto& a, auto& b) { return a.first > b.first; });
+  add(" | not on the CPU path:");
+  for (size_t i = 0; i < slow.size() && i < 6; ++i) {
+    const uint64_t k = slow[i].second;
+    add(" [%s fmt%u %ux%u %s d%u x%.1f]", kTexPathNames[k >> 56], uint32_t((k >> 48) & 0x3F), uint32_t((k >> 16) & 0x1FFF) + 0u,
+        uint32_t(k & 0x1FFF), ((k >> 47) & 1) ? "tiled" : "linear", uint32_t((k >> 45) & 3), double(slow[i].first) / frames);
+  }
+  g_texpath_counts.clear();
+  std::memset(g_texpath_total, 0, sizeof(g_texpath_total));
+}
 #endif
 
 namespace rex::graphics::vulkan {
@@ -1486,8 +1551,12 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   static uint32_t cpu_loads = 0, cpu_fallbacks = 0, cpu_versions_created = 0, cpu_in_place = 0;
   static uint64_t cpu_bytes = 0;
-  auto fallback = [&]() {
+  auto fallback = [&](uint32_t reason) {
     ++cpu_fallbacks;
+#if REX_PLATFORM_SWITCH
+    NoteTexPath(reason, uint32_t(texture.key().format), texture.key().tiled, uint32_t(texture.key().dimension),
+                texture.key().GetWidth(), texture.key().GetHeight());
+#endif
     // The GPU path loads all of the current version: as a full load for the row history.
     const uint64_t gen = ++vulkan_texture.cpu_gen;
     VulkanTexture::CpuLoadRows& rows =
@@ -1520,7 +1589,7 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
   VulkanTexture::Usage usage = vulkan_texture.usage();
   if (texture.base_written_by_gpu || (usage != VulkanTexture::Usage::kUndefined &&
                                       usage != VulkanTexture::Usage::kGuestShaderSampled)) {
-    return fallback();
+    return fallback(kPathGpuWritten);
   }
   const TextureKey key = texture.key();
   uint32_t bytes_per_texel = load_shader == kLoadShaderIndex8bpb    ? 1
@@ -1535,12 +1604,12 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
       row_bytes > vulkan_texture.cpu_row_pitch() ||
       uint64_t(guest_row_pitch) * (height - 1) + row_bytes > texture.GetGuestBaseSize() ||
       (endian != xenos::Endian::kNone && (row_bytes & 3) != 0)) {
-    return fallback();
+    return fallback(!bytes_per_texel ? kPathFormat : key.tiled ? kPathTiled : kPathLayout);
   }
   const uint8_t* src =
       shared_memory().guest_memory().TranslatePhysical(uint32_t(key.base_page) << 12);
   if (!src) {
-    return fallback();
+    return fallback(kPathNoSource);
   }
   // Palettes that read as zeros in guest RAM still have data in the shared memory buffer (char
   // select, cause unknown): load those like vanilla. Non-zero palettes (fights) stay on the CPU.
@@ -1560,7 +1629,7 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
         std::printf("[cpu] zero palette @%05X %ux1: shared memory path\n",
                     uint32_t(key.base_page), width);
       }
-      return fallback();
+      return fallback(kPathZeroPalette);
     }
   }
   // The first load goes into the untouched PREINITIALIZED image. Later ones write the current
@@ -1591,7 +1660,7 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
       bool created = false;
       if (!vulkan_texture.SwitchToFreeCpuVersion(completed_submission, current_submission,
                                                  created)) {
-        return fallback();
+        return fallback(kPathNoFreeVersion);
       }
       vulkan_texture.cpu_last_use_submission = 0;
       if (created) {
@@ -1692,6 +1761,7 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
   }
   ++cpu_loads;
   cpu_bytes += uint64_t(row_bytes) * rows_copied;
+  RexSwitchPerfAdd(41, uint64_t(row_bytes) * rows_copied);  // report: CPU texture copy MB per frame
   if ((cpu_loads & 2047) == 0) {
     std::printf("[cpu] %u loads (%llu MB), %u in place, %u fallbacks, %u versions created\n",
                 cpu_loads, (unsigned long long)(cpu_bytes >> 20), cpu_in_place, cpu_fallbacks,
@@ -1818,8 +1888,24 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   if (load_shader == kLoadShaderIndexUnknown) {
     return false;
   }
+#if REX_PLATFORM_SWITCH
+  {
+    const uint32_t path_reason = !vulkan_texture.cpu_direct() ? kPathNotEligible
+                                 : !load_base                 ? kPathNoBase
+                                 : load_mips                  ? kPathMips
+                                                              : kPathCpu;
+    if (path_reason != kPathCpu) {
+      NoteTexPath(path_reason, uint32_t(texture_key.format), texture_key.tiled, uint32_t(texture_key.dimension),
+                  texture_key.GetWidth(), texture_key.GetHeight());
+    }
+  }
+#endif
   if (vulkan_texture.cpu_direct() && load_base && !load_mips &&
       LoadTextureCpuDirect(vulkan_texture, load_shader)) {
+#if REX_PLATFORM_SWITCH
+    NoteTexPath(kPathCpu, uint32_t(texture_key.format), texture_key.tiled, uint32_t(texture_key.dimension),
+                texture_key.GetWidth(), texture_key.GetHeight());
+#endif
     return true;
   }
   VkPipeline pipeline = texture_key.scaled_resolve ? load_pipelines_scaled_[load_shader]

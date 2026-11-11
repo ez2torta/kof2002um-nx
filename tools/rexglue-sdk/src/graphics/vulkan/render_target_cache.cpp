@@ -1927,6 +1927,14 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                       uint32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8) * 8,
                       uint32_t(dest_info.copy_dest_endian), bool(dest_info.copy_dest_swap));
                   rtt_result = rtt_copied;
+#if REX_PLATFORM_SWITCH
+                  if (rtt_copied) {
+                    RexSwitchPerfCount(43);  // resolve copied straight into a texture
+                    if (dest_info.copy_dest_swap) {
+                      RexSwitchPerfCount(42);  // ... and it needed the red/blue swap (extra blit)
+                    }
+                  }
+#endif
                   if (!rtt_copied) {
                     rtt_reason = "no matching texture";
                   }
@@ -1940,6 +1948,18 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                 std::find(rtt_seen.begin(), rtt_seen.begin() + rtt_logged, rtt_sig) ==
                     rtt_seen.begin() + rtt_logged) {
               rtt_seen[rtt_logged++] = rtt_sig;
+              REXGPU_INFO(
+                  "[rtt] resolve -> {:08X} {}x{} @{},{} pitch {}: {} (src base {} pitch {} msaa {} "
+                  "fmt {}, dest info {:08X}, swap {})",
+                  resolve_info.copy_dest_base,
+                  uint32_t(resolve_info.coordinate_info.width_div_8) * 8,
+                  resolve_info.height_div_8 * 8,
+                  uint32_t(resolve_info.copy_dest_coordinate_info.offset_x_div_8) * 8,
+                  uint32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8) * 8,
+                  uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) * 32,
+                  rtt_reason ? rtt_reason : "copied", uint32_t(e.base_tiles),
+                  uint32_t(e.pitch_tiles), uint32_t(e.msaa_samples), uint32_t(e.format),
+                  dest_info.value, uint32_t(dest_info.copy_dest_swap));
               std::printf(
                   "[rtt] resolve -> %08X %ux%u @%u,%u pitch %u: %s (src base %u pitch %u msaa %u "
                   "fmt %u, dest info %08X)\n",

@@ -54,6 +54,12 @@
 extern "C" void rex_autotest_take_interval(uint64_t* out, uint32_t cap);
 // graphics/vulkan/command_processor.cpp: render pass ends by call site (address, count pairs), zeroes them.
 extern "C" uint32_t rex_cp_take_rp_sites(uint64_t* out, uint32_t cap_pairs);
+// graphics/vulkan/command_processor.cpp: pending barriers by pushing call site (bit 0 = buffer barrier).
+extern "C" uint32_t rex_cp_take_barrier_sites(uint64_t* out, uint32_t cap_pairs);
+// core/autotest.cpp: last stage background file the game opened.
+extern "C" void rex_take_stage_name(char* out, uint32_t cap);
+// graphics/vulkan/texture_cache.cpp: texture load paths (CPU direct vs GPU) with reasons, and the textures that miss the CPU path.
+extern "C" void rex_tex_take_path_stats(char* out, uint32_t cap, double frames);
 #include "rex/ui/switch_apm.h"
 #include "rex/ui/switch_saltynx.h"
 #include "rex/ui/switch_sysclk.h"
@@ -600,6 +606,46 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
         }
       }
       std::fprintf(f, "\n");
+    }
+  }
+  {
+    char stage[40];
+    rex_take_stage_name(stage, sizeof(stage));
+    std::fprintf(f, "     stage background: %s\n", stage[0] ? stage : "(none opened yet)");
+    const double presents = double(counters_now[0] - counters_last[0]);
+    uint64_t sites[2 * 24];
+    const uint32_t n = rex_cp_take_barrier_sites(sites, 24);
+    if (n > 0 && presents > 0.0) {
+      // Biggest first (few entries: selection sort).
+      for (uint32_t i = 0; i < n; ++i) {
+        uint32_t best = i;
+        for (uint32_t j = i + 1; j < n; ++j) {
+          if (sites[2 * j + 1] > sites[2 * best + 1]) best = j;
+        }
+        std::swap(sites[2 * i], sites[2 * best]);
+        std::swap(sites[2 * i + 1], sites[2 * best + 1]);
+      }
+      std::fprintf(f, "     barriers pushed per frame by caller (i = image, b = buffer):");
+      for (uint32_t i = 0; i < n && i < 10; ++i) {
+        const u64 a = sites[2 * i];
+        std::fprintf(f, " %c image+0x%llx x%.1f", (a & 1) ? 'b' : 'i', (unsigned long long)((a & ~u64(1)) - g_base),
+                     double(sites[2 * i + 1]) / presents);
+      }
+      std::fprintf(f, "\n");
+    }
+    if (presents > 0.0) {
+      static char tex_stats[900];
+      rex_tex_take_path_stats(tex_stats, sizeof(tex_stats), presents);
+      std::fprintf(f, "     texture loads per frame %s\n", tex_stats);
+    }
+    if (presents > 0.0) {
+      std::fprintf(f, "     resolves copied straight into a texture: %.1f per frame (%.1f of them with the red/blue swap blit)\n",
+                   double(counters_now[43] - counters_last[43]) / presents,
+                   double(counters_now[42] - counters_last[42]) / presents);
+    }
+    if (presents > 0.0) {
+      std::fprintf(f, "     CPU texture copies: %.2f MB per frame\n",
+                   double(counters_now[41] - counters_last[41]) / presents / 1048576.0);
     }
   }
   // Work the game sends to the GPU, per presented frame. One screen is
