@@ -24,6 +24,19 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+#if REX_PLATFORM_SWITCH
+#include <chrono>
+// devkitnx zones (core/autotest.cpp): 25 cp_vcmp, 26 cp_vval, 27 cp_vcpy, 28 n_vpg, 30 n_vfb.
+extern "C" void rex_autotest_cpu_add(uint32_t zone, uint64_t ns);
+namespace {
+inline uint64_t SmNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+}  // namespace
+#endif
+
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -466,6 +479,16 @@ bool VulkanSharedMemory::TryCpuUpload(
     return range;
   };
   const uint32_t page_log2 = page_size_log2();
+#if REX_PLATFORM_SWITCH
+  uint64_t t_cmp = SmNowNs();
+  struct CmpZone {
+    uint64_t& t;
+    ~CmpZone() { if (t) rex_autotest_cpu_add(25, SmNowNs() - t); }
+  } cmp_zone{t_cmp};
+  auto fallback_count = [] { rex_autotest_cpu_add(30, 1000000ull); };
+#else
+  auto fallback_count = [] {};
+#endif
   // Pending commands must see the same bytes they were recorded with.
   for (const auto& pages : upload_page_ranges) {
     const uint32_t start = pages.first << page_log2;
@@ -478,6 +501,7 @@ bool VulkanSharedMemory::TryCpuUpload(
       }
       if (inflight.gpu_write) {
         ++cpu_upload_fallbacks_;
+        fallback_count();
         return false;
       }
       if (!cpu_mapping_coherent_) {
@@ -486,20 +510,40 @@ bool VulkanSharedMemory::TryCpuUpload(
       }
       if (std::memcmp(cpu_mapping_ + lo, memory().TranslatePhysical(lo), hi - lo) != 0) {
         ++cpu_upload_fallbacks_;
+        fallback_count();
         return false;
       }
     }
   }
+#if REX_PLATFORM_SWITCH
+  rex_autotest_cpu_add(25, SmNowNs() - t_cmp);
+  t_cmp = 0;
+  uint64_t n_pages = 0;
+#endif
   for (const auto& pages : upload_page_ranges) {
     const uint32_t start = pages.first << page_log2;
     const uint32_t length = pages.second << page_log2;
+#if REX_PLATFORM_SWITCH
+    const uint64_t t_val = SmNowNs();
+#endif
     MakeRangeValid(start, length, false);
+#if REX_PLATFORM_SWITCH
+    const uint64_t t_cpy = SmNowNs();
+    rex_autotest_cpu_add(26, t_cpy - t_val);
+    n_pages += pages.second;
+#endif
     std::memcpy(cpu_mapping_ + start, memory().TranslatePhysical(start), length);
     if (!cpu_mapping_coherent_) {
       VkMappedMemoryRange range = mapped_range(start, start + length);
       dfn.vkFlushMappedMemoryRanges(device, 1, &range);
     }
+#if REX_PLATFORM_SWITCH
+    rex_autotest_cpu_add(27, SmNowNs() - t_cpy);
+#endif
   }
+#if REX_PLATFORM_SWITCH
+  rex_autotest_cpu_add(28, n_pages * 1000000ull);
+#endif
   if ((++cpu_uploads_ & 8191) == 0) {
     std::printf("[cpuup] %llu cpu uploads, %llu fell back to copies\n",
                 (unsigned long long)cpu_uploads_, (unsigned long long)cpu_upload_fallbacks_);

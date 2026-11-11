@@ -80,6 +80,10 @@ REXCVAR_DEFINE_INT32(texture_cpu_copy_worker_core, -1, "GPU",
                      "this core (0-2; -1 = on the command processor thread); the submission waits "
                      "for them")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(texture_cpu_copy_claim, false, "GPU",
+                    "texture_cpu_copy_worker_core: the game's write barrier copies the overlapping "
+                    "jobs the worker has not started itself instead of waiting for the queue")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(texture_load_cpu_poll, true, "GPU",
                     "With texture_load_cpu_direct: don't upload those textures' guest range to the "
                     "shared memory buffer (no page protection to re-arm); instead compare guest "
@@ -1526,6 +1530,7 @@ class CpuCopyWorker {
     std::unique_lock<std::mutex> lock(mutex_);
     done_cv_.wait(lock, [this]() { return pushed_ - completed_ < kRingSize; });
     ring_[pushed_ % kRingSize] = job;
+    state_[pushed_ % kRingSize].store(kPending, std::memory_order_relaxed);
     ++pushed_;
     lock.unlock();
     work_cv_.notify_one();
@@ -1551,9 +1556,77 @@ class CpuCopyWorker {
     done_cv_.wait(lock, [this, last_overlapping]() { return completed_ > last_overlapping; });
     return true;
   }
+  // texture_cpu_copy_claim: like WaitForSourceRange, but the calling thread claims the overlapping
+  // jobs the worker has not started (and, before each, the pending earlier jobs writing the same
+  // allocation range, so the later copy still wins) and copies them itself; it waits only for the
+  // ones the worker is running.
+  bool ClaimSourceRange(uint32_t begin, uint32_t end) {
+    uint64_t claimed[kRingSize];
+    uint32_t claimed_count = 0;
+    uint64_t waiting[kRingSize];
+    uint32_t waiting_count = 0;
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (uint64_t i = completed_; i < pushed_; ++i) {
+      const CpuCopyJob& job = ring_[i % kRingSize];
+      if (!(job.src_physical_begin < end && begin < job.src_physical_end)) {
+        continue;
+      }
+      // Earlier pending jobs writing the same destination go first.
+      for (uint64_t j = completed_; j < i; ++j) {
+        const CpuCopyJob& prev = ring_[j % kRingSize];
+        if (prev.allocation == job.allocation && prev.flush_offset < job.flush_offset + job.flush_size &&
+            job.flush_offset < prev.flush_offset + prev.flush_size) {
+          ClaimOrWait(j, claimed, claimed_count, waiting, waiting_count);
+        }
+      }
+      ClaimOrWait(i, claimed, claimed_count, waiting, waiting_count);
+    }
+    if (!claimed_count && !waiting_count) {
+      return false;
+    }
+    // First the jobs the worker is running (they may write the destination of a claimed one; they
+    // never wait for the claimed ones, so this cannot deadlock).
+    for (uint32_t k = 0; k < waiting_count; ++k) {
+      const uint64_t i = waiting[k];
+      done_cv_.wait(lock, [this, i]() {
+        return completed_ > i || state_[i % kRingSize].load(std::memory_order_acquire) == kDone;
+      });
+    }
+    if (claimed_count) {
+      lock.unlock();
+      // The slots stay untouched: completed_ cannot pass a job that is not done.
+      for (uint32_t k = 0; k < claimed_count; ++k) {
+        RunCpuCopyJob(ring_[claimed[k] % kRingSize]);
+      }
+      lock.lock();
+      for (uint32_t k = 0; k < claimed_count; ++k) {
+        state_[claimed[k] % kRingSize].store(kDone, std::memory_order_release);
+      }
+      done_cv_.notify_all();
+    }
+    return true;
+  }
 
  private:
   static constexpr uint64_t kRingSize = 64;
+  enum : uint8_t { kPending, kRunning, kDone };
+  // With mutex_ held.
+  void ClaimOrWait(uint64_t i, uint64_t* claimed, uint32_t& claimed_count, uint64_t* waiting,
+                   uint32_t& waiting_count) {
+    for (uint32_t k = 0; k < claimed_count; ++k) {
+      if (claimed[k] == i) return;
+    }
+    for (uint32_t k = 0; k < waiting_count; ++k) {
+      if (waiting[k] == i) return;
+    }
+    uint8_t expected = kPending;
+    if (state_[i % kRingSize].compare_exchange_strong(expected, kRunning,
+                                                      std::memory_order_acq_rel)) {
+      claimed[claimed_count++] = i;
+    } else if (expected == kRunning) {
+      waiting[waiting_count++] = i;
+    }
+  }
   void Run() {
 #if REX_PLATFORM_SWITCH
     if (core_ >= 0 && core_ <= 2) {
@@ -1566,12 +1639,23 @@ class CpuCopyWorker {
       if (started_ == pushed_) {
         return;  // stop_ with nothing left.
       }
-      const CpuCopyJob& job = ring_[started_ % kRingSize];
+      const uint64_t index = started_;
+      const CpuCopyJob& job = ring_[index % kRingSize];
       ++started_;
-      lock.unlock();
-      // The slot stays untouched until completed_ passes it (Push waits on completed_).
-      RunCpuCopyJob(job);
-      lock.lock();
+      uint8_t expected = kPending;
+      if (state_[index % kRingSize].compare_exchange_strong(expected, kRunning,
+                                                            std::memory_order_acq_rel)) {
+        lock.unlock();
+        // The slot stays untouched until completed_ passes it (Push waits on completed_).
+        RunCpuCopyJob(job);
+        lock.lock();
+        state_[index % kRingSize].store(kDone, std::memory_order_release);
+      } else {
+        // Claimed by the game thread (ClaimSourceRange): completed_ stays in order.
+        done_cv_.wait(lock, [this, index]() {
+          return state_[index % kRingSize].load(std::memory_order_acquire) == kDone;
+        });
+      }
       ++completed_;
       done_cv_.notify_all();
     }
@@ -1581,6 +1665,7 @@ class CpuCopyWorker {
   std::mutex mutex_;
   std::condition_variable work_cv_, done_cv_;
   std::array<CpuCopyJob, kRingSize> ring_;
+  std::array<std::atomic<uint8_t>, kRingSize> state_{};
   uint64_t pushed_ = 0, started_ = 0, completed_ = 0;
   bool stop_ = false;
 };
@@ -1659,7 +1744,8 @@ extern "C" void rex_texture_cpu_copy_barrier(uint32_t guest_address, uint32_t si
   const uint32_t end =
       physical == UINT32_MAX ? UINT32_MAX : uint32_t(std::min<uint64_t>(uint64_t(physical) + size, UINT32_MAX));
   const auto start = std::chrono::steady_clock::now();
-  if (worker->WaitForSourceRange(begin, end)) {
+  static const bool claim = REXCVAR_GET(texture_cpu_copy_claim);
+  if (claim ? worker->ClaimSourceRange(begin, end) : worker->WaitForSourceRange(begin, end)) {
     g_cpu_copy_barrier_waits.fetch_add(1, std::memory_order_relaxed);
     g_cpu_copy_barrier_ns.fetch_add(
         uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(

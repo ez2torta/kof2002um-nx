@@ -51,12 +51,22 @@ std::atomic<bool> g_gpu_passes_seen{false};
 // cp_draw = whole VulkanCommandProcessor::IssueDraw (includes cp_pre, cp_tex, cp_post);
 // cp_copy = row copies + flush of the CPU texture loads (part of cp_tex); cp_post = after
 // UpdateBindings to the end (vertex/shared memory ranges, barriers, render pass, draw); cp_exec = DeferredCommandBuffer::Execute (Vulkan command recording).
-constexpr uint32_t kCpuZones = 19;
+// Parts of cp_post (2026-11-11): cp_vbuf = vertex buffer + memexport RequestRange, cp_smem =
+// guest DMA index snapshot + shared_memory Use, cp_rpass = SubmitBarriersAndEnterRenderTarget
+// CacheRenderPass; the rest of cp_post is the draw recording. n_cmd/n_bind/n_dyn = all commands,
+// binds and dynamic state replayed by Execute. AT__MAX_ZONES is 48 in include/rex/autotest.h.
+// Inside VulkanSharedMemory::TryCpuUpload: cp_vcmp = memcmp against in-flight ranges, cp_vval =
+// MakeRangeValid (re-arms the access watches), cp_vcpy = memcpy + flush, n_vpg = pages uploaded,
+// n_vfb = fallbacks to GPU copies; n_vreq = vertex buffer RequestRange calls.
+constexpr uint32_t kCpuZones = 31;
 const char* const kCpuZoneNames[kCpuZones] = {"cp_idle", "cp_fence", "cp_submit", "cp_tex",
                                               "n_tex",   "n_batch",  "n_skip",    "cp_wrm",
                                               "cp_wrm_slp", "n_wrm", "n_draw", "n_rp",
                                               "n_bar",   "n_copy",   "n_disp",    "cp_draw",
-                                              "cp_copy", "cp_post",  "cp_exec"};
+                                              "cp_copy", "cp_post",  "cp_exec",   "cp_vbuf",
+                                              "cp_smem", "cp_rpass", "n_cmd",     "n_bind",
+                                              "n_dyn",   "cp_vcmp",  "cp_vval",   "cp_vcpy",
+                                              "n_vpg",   "n_vreq",   "n_vfb"};
 std::atomic<uint64_t> g_cpu_zone_ns[kCpuZones];
 }  // namespace
 

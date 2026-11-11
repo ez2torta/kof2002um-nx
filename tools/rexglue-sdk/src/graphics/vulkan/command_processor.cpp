@@ -5638,6 +5638,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 #ifdef __SWITCH__
   REX_CP_ZONE_SCOPE(17);
+  REX_CP_ZONE_START(cp_vbuf_start);
 #endif
 
   // Ensure vertex buffers are resident.
@@ -5677,6 +5678,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
+#ifdef __SWITCH__
+      rex_autotest_cpu_add(29, 1000000ull);  // n_vreq
+#endif
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
@@ -5714,6 +5718,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return false;
     }
   }
+#ifdef __SWITCH__
+  REX_CP_ZONE_ADD(19, cp_vbuf_start);
+  REX_CP_ZONE_START(cp_smem_start);
+#endif
 
   ScratchBufferAcquisition guest_dma_index_scratch_buffer;
   if (primitive_processing_result.index_buffer_type ==
@@ -5770,6 +5778,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   } else {
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   }
+#ifdef __SWITCH__
+  REX_CP_ZONE_ADD(20, cp_smem_start);
+  REX_CP_ZONE_START(cp_rpass_start);
+#endif
 
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
@@ -5777,6 +5789,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+#ifdef __SWITCH__
+  REX_CP_ZONE_ADD(21, cp_rpass_start);
+#endif
 
   // Draw.
 #if REX_PLATFORM_SWITCH

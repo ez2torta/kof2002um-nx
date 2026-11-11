@@ -14,11 +14,14 @@ dibuja con un backend Vulkan que corre sobre NVK (Mesa).
 ## Estado
 
 En desarrollo. En portátil, con los relojes de fábrica de la consola y sin overclock (CPU 1020 MHz, GPU 460 MHz,
-memoria 1331 MHz), una pelea completa va a ~59 FPS (antes ~45; el objetivo son 60 estables). Por debajo de 60 el
+memoria 1331 MHz), una pelea completa va a ~58 FPS (antes ~45; el objetivo son 60 estables). Por debajo de 60 el
 juego va un poco más lento de lo normal, porque su lógica avanza un paso por cada cuadro dibujado.
 
-**Problemas conocidos:** con las mejoras del 11/11 todavía no se probaron los menús, la selección de personajes ni el
-modo dock (la medición anterior en dock, del 7/11, daba ~52–56 FPS).
+**Mandos:** L+R+ZR abre el selector de mandos de la Switch (hasta 4 jugadores, Joy-Con sueltos o Pro Controller).
+Jugar de a dos todavía no se probó.
+
+**Problemas conocidos:** con las mejoras del 11/11 todavía no se probó el modo dock (la medición anterior en dock,
+del 7/11, daba ~52–56 FPS).
 
 **Arreglado (2026-11-07):** la pantalla de selección de personajes salía negra (sin grilla, fondo ni cursores), y
 faltaban el fondo y la interfaz de la pantalla de orden. Ahora se ven bien, sin costo de rendimiento en la pelea.

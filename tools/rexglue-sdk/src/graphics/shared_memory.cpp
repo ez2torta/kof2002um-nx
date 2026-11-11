@@ -22,6 +22,17 @@
 
 extern "C" int32_t rex_diag_draw_window(void);  // vulkan/command_processor.cpp
 #include <cstdio>
+#include <rex/cvar.h>
+
+// 2026-11-11: the game requests its vertex buffers one draw at a time (~97 RequestRange per frame
+// for ~49 invalidated 4 KB pages), and each upload re-arms the access watch with its own
+// rex::memory::Protect per mirror heap (~0.8 ms of CP time per frame). With N > 0, each upload
+// range is widened over up to N neighbouring pages that are also invalid, so a whole run of
+// invalidated pages is uploaded and protected at once. Only without sparse residency.
+REXCVAR_DEFINE_INT32(shared_memory_upload_widen_pages, 0, "GPU",
+                     "Widen shared memory uploads over up to this many neighbouring invalid pages "
+                     "on each side (fewer watch re-arms). 0 = off");
+
 namespace rex::graphics {
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
@@ -483,6 +494,40 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       if (range_start != UINT32_MAX) {
         append_upload_range(range_start, page_last + 1 - range_start);
       }
+    }
+
+    const int32_t widen = REXCVAR_GET(shared_memory_upload_widen_pages);
+    if (widen > 0 && !upload_ranges_.empty() &&
+        host_gpu_memory_sparse_granularity_log2_ == UINT32_MAX) {
+      const uint32_t page_count = kBufferSize >> page_size_log2_;
+      auto page_valid = [this](uint32_t page) {
+        return (system_page_flags_valid_[page >> 6] >> (page & 63)) & 1;
+      };
+      for (std::pair<uint32_t, uint32_t>& range : upload_ranges_) {
+        uint32_t lo = range.first;
+        uint32_t hi = range.first + range.second;  // Exclusive.
+        for (int32_t n = 0; n < widen && lo > 0 && !page_valid(lo - 1); ++n) {
+          --lo;
+        }
+        for (int32_t n = 0; n < widen && hi < page_count && !page_valid(hi); ++n) {
+          ++hi;
+        }
+        range.first = lo;
+        range.second = hi - lo;
+      }
+      // Widened ranges stay sorted by start but may now overlap or touch: merge them.
+      size_t write = 0;
+      for (size_t i = 1; i < upload_ranges_.size(); ++i) {
+        std::pair<uint32_t, uint32_t>& previous = upload_ranges_[write];
+        const std::pair<uint32_t, uint32_t>& current = upload_ranges_[i];
+        const uint32_t previous_end = previous.first + previous.second;
+        if (current.first <= previous_end) {
+          previous.second = std::max(previous_end, current.first + current.second) - previous.first;
+        } else {
+          upload_ranges_[++write] = current;
+        }
+      }
+      upload_ranges_.resize(write + 1);
     }
   }
 

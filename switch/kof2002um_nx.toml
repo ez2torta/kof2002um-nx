@@ -19,7 +19,7 @@ vsync_precise_spin_us = 300
 texture_poll_hook_dirty_rows = true
 shared_memory_cpu_upload = true
 vulkan_sparse_shared_memory = false
-vulkan_submit_min_interval_us = 2000
+vulkan_submit_min_interval_us = 8000
 cp_pin_core = 1
 cp_idle_spin_us = 300
 main_exclusive_core = 0
@@ -29,6 +29,7 @@ spirv_ps_implicit_lod = true
 spirv_ps_static_state = true
 spirv_ps_epx_hash = 716457010
 texture_cpu_copy_worker_core = 2
+texture_cpu_copy_claim = true
 [log]
 to_file = true
 level = "debug"

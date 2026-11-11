@@ -1,5 +1,40 @@
 # KOF 2002 UM NX — estado del port
 
+## `vulkan_submit_min_interval_us=8000`: portátil ~58 fps; build 20261111b (2026-11-11, noche)
+
+- **Partir el frame en submits ya estaba hecho**: `OnPrimaryBufferEnd` hace submit al final de cada buffer primario del juego, limitado por `vulkan_submit_min_interval_us` (~7,6 submits por frame con 2000). El problema era el contrario: **demasiados submits**.
+- **Barrido en portátil** (`_nl_subN.json` = `_nl_claim.json` con otro intervalo; logs `_logs/ab__nl_sub*_N.log`, runs 194642–201000): 1000 → 45,9 / 48,7 fps; 2000 → 52,6 / 53,5; 4000 → 54,2 / 57,1 / 52,5 / 54,4 / 51,5; **8000 → 58,6 / 57,6**; 16000 → 59,4 (un solo run válido; el otro no conectó nxlink, sin crash). **Queda 8000** en el TOML. 16000 queda para confirmar (lo de `submit_on_primary_buffer_end=false` se colgaba: el lockstep necesita algún submit).
+- Binds: ~2 comandos de bind por draw (sets de constantes nuevos por draw + pipeline/índices), ~3,4 µs por comando en `cp_exec`: sacar los redundantes ganaría < 0,2 ms. No se hizo.
+- **Build para la SD**: `switch/kof2002um-nx-20261111b/` (NRO = `kof2002um-nx.nro` de las 19:28, con claim; TOML = el de 20261111 + `texture_cpu_copy_claim = true` + intervalo 8000). El usuario probó la run y dijo que anda perfecto.
+- **Dos mandos**: el driver (`input/switch/switch_input_driver.cpp`) configura `kPlayerCount` jugadores, slots Handheld/No1–No4 y L+R+ZR abre `hidLaShowControllerSupport`. **Nunca se probó con dos mandos.**
+- **Ojo**: `Set-Content -Encoding utf8` de PowerShell 5.1 escribe BOM y el runner rechaza el JSON; generar configs con sed.
+- **Próximo paso**: confirmar 16000 contra 8000 (×3); probar dos mandos en la consola.
+
+## Plan para los últimos ~1,5 ms y desglose de cp_post (2026-11-11, noche)
+
+- **El usuario no quiere que le pregunte decisiones técnicas**: se las consulto al agente de segunda opinión y decido yo.
+- **Segunda opinión** (agente; WebSearch falló, bajó las fuentes con curl): Eden `vk_scheduler.h` (graba en chunks, un worker emite los vkCmd y se hace flush a mitad de frame), Dolphin `CommandBufferManager.h` y RPCS3 `VKCommandStream.h` (solo el submit en otro hilo, con drain antes de esperar fences), UnleashedRecomp `gpu/video.cpp` (cola de comandos; la destrucción de recursos también pasa por la cola). Xenia canary no tiene hilo de submit.
+  - **cp_exec y los ~3 ms de huecos de GPU**: primero **partir el frame en 2-3 submits** (EndSubmission/BeginSubmission cada ~40 draws o por pase de RT; cuidado con `ExecuteHoistedUploads` por submit) y sacar comandos redundantes. Recién después, un hilo de submit con doble buffer; no hay núcleo libre (¿tenemos el núcleo 3? `svcGetInfo(CoreMask)`, sin verificar). Riesgos: drenar antes de cada espera de fence, liberación de recursos diferida por submission, `vkQueueBindSparse` y query pools en el mismo hilo.
+  - **Espera del juego al worker**: estado atómico por job `pending → running → done`. La barrera reclama con CAS el job que se solapa y lo copia ella misma (antes, los predecesores con el **mismo destino**); si está `running`, espera solo a ese. No copiar inline en el CP (lo carga, como el reclamo por fila).
+  - **cp_post**: medir; se sospecha de `RequestRange` (watches con `svcSetProcessMemoryPermission`, sin verificar) y de los cambios de pase.
+- **Zonas nuevas** (`core/autotest.cpp`, kCpuZones 25; `include/rex/autotest.h` **AT__MAX_ZONES 40**; ojo, la copia del port ya difería de `devkitnx/include/autotest.h`, que tiene 24 y no tiene `input_latch`): `cp_vbuf` (19, RequestRange de vfetch y memexport), `cp_smem` (20, snapshot de índices DMA + `shared_memory_->Use`), `cp_rpass` (21, `SubmitBarriersAndEnterRenderTargetCacheRenderPass`); lo que sobra de cp_post es la grabación del draw. En `Execute`: `n_cmd` (22, todos los comandos), `n_bind` (23, bind de pipeline, sets y buffers), `n_dyn` (24, estado dinámico + push constants).
+- **Medido** (run 185638, `_nl_wk2.json`, 58,1 fps): cp_post 2,03 = **cp_vbuf 1,66** + cp_smem 0,02 + cp_rpass 0,06 + grabación ~0,3. cp_exec 1,78 con **n_cmd 527** (n_bind 224, n_dyn 84, 105 draws, 38 barreras, 18 copias).
+- **Dentro de cp_vbuf** (zonas en `VulkanSharedMemory::TryCpuUpload`: `cp_vcmp`, `cp_vval`, `cp_vcpy`, `n_vpg`, `n_vfb`; `n_vreq` en IssueDraw; kCpuZones 31, AT__MAX_ZONES 48): n_vreq **97** por frame, n_vpg **49 páginas**, n_vfb 0. **cp_vval 0,82** (`MakeRangeValid` → `EnablePhysicalMemoryAccessCallbacks` → un `rex::memory::Protect` por tramo en cada uno de los 3 heaps espejo A0/C0/E0), cp_vcmp 0,55 (memcmp contra rangos en vuelo), cp_vcpy 0,21.
+- **Prueba**: cvar `shared_memory_upload_widen_pages=N` (`graphics/shared_memory.cpp` `RequestRanges`, default 0): cada tramo a subir se ensancha sobre hasta N páginas vecinas también inválidas y se fusiona, para proteger una vez por tramo largo. Solo sin sparse. Riesgo sin verificar: leer páginas físicas nunca usadas (si no tienen memoria detrás, crash). Config `_nl_wid64.json`. A/B: script `runab.ps1` del scratchpad de la sesión (HOME+A, run y resumen).
+- **La A/B no corrió**: `runab.ps1 -Configs a,b,c` llamado con `powershell -File` recibe la lista como un solo string, así que hizo un único run con nombre inválido. Hay que pasar un config por llamada, o usar `-Configs @(...)` desde `-Command`. La build con el cvar está en `kof2002um-nx/kof2002um-nx.nro` (compilada OK; el cvar viene apagado por defecto, así que se comporta igual que antes).
+- **wid64 DESCARTADO** (run 2026-11-11 ~19:05, log `_logs/ab__nl_wid64_1.log`): arranca a ~30 fps y a los ~30 s se cuelga en un bucle de fallos de página (`SDK handler` ~129 mil/s, game 0 fps). Ensanchar protege páginas que el juego escribe todo el tiempo. El cvar queda, apagado.
+- **Reclamo atómico por job** implementado (cvar `texture_cpu_copy_claim`, default false; `CpuCopyWorker::ClaimSourceRange` en `vulkan/texture_cache.cpp`, estado `state_` pending/running/done por slot; la barrera reclama los jobs no empezados que se solapan, más los anteriores con el mismo destino, espera primero los que corre el worker y copia los reclamados). Config `_nl_claim.json` (= wk2 + claim). `runab.ps1` del scratchpad de esta sesión acepta `-SkipFirstHome` y numera los logs (`ab_<cfg>_<n>.log`).
+- **A/B claim contra wk2** (runs 193310–193835, alternados; logs `_logs/ab__nl_claim_1/3.log`, `ab__nl_wk2_2/4.log`): **claim 53,9 / 54,1 fps** contra wk2 49,6 / 52,9. Espera del juego al worker: claim 24,2–24,8 mil esperas y **1,69 / 1,84 s** contra 16,5–17,3 mil y 2,13 / 2,13 s (−15–20 %). cp_wrm medio 2,75–2,90 contra 2,84–3,99. Imagen correcta (`pelea`/`pelea2` de 193647). **Queda prendido** (ganancia chica pero en los dos pares).
+  - Ojo: **toda la tanda dio menos que antes** (wk2 había dado 58,1–59 fps a la tarde). Posible temperatura/batería o efecto del run colgado anterior; comparar solo dentro de la misma tanda.
+  - La espera que queda (~1,7 s en ~20 s de run, ~70 µs por espera) es mayormente el worker ocupado con el job que el juego necesita (`running`), no la cola.
+- **Próximo paso**:
+  1. Partir el frame en 2-3 submits y quitar binds redundantes (n_bind 224 por frame); ver detalle arriba en la segunda opinión.
+  2. Volver a medir wk2 y claim en una tanda "fría" para confirmar el nivel absoluto (58 contra 54).
+- **Próximo paso** (viejo):
+  1. Correr `_nl_wid64.json` y `_nl_wk2.json` (×2 cada uno). Si wid64 no crashea y baja cp_vval, dejarlo y buscar el N mejor (16/64/256).
+  2. Reclamo atómico por job en el worker de copias (diseño de la segunda opinión, arriba).
+  3. Partir el frame en 2-3 submits y quitar binds redundantes (n_bind 224 por frame).
+
 ## Copias de texturas por CPU en un worker (`texture_cpu_copy_worker_core=2`): portátil ~59 fps (2026-11-11, noche)
 
 - **Medido antes**: `cp_copy` (las copias de filas + flush de `LoadTextureCpuDirect`) = **2,41 ms de los 3,87 de cp_tex**; ~43 cargas por frame de ~120 KB (~5 MB por frame).
