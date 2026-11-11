@@ -23,6 +23,7 @@
   do {                                                                                     \
     REX_PROFILE_INDIRECT_DISPATCH();                                                       \
     uint32_t rex_indirect_target_ = (uint32_t)(x);                                         \
+    ctx.last_indirect_target = rex_indirect_target_;  /* one store; read by the crash log */ \
     PPCFunc* rex_indirect_func_;                                                           \
     if ((uint32_t)(rex_indirect_target_ - REX_CODE_BASE) <                                 \
         REX_CODE_SIZE + REX_THUNK_RESERVE_SIZE) [[likely]] {                               \

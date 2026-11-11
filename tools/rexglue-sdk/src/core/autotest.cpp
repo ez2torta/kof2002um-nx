@@ -54,11 +54,19 @@ const char* const kCpuZoneNames[kCpuZones] = {"cp_idle", "cp_fence", "cp_submit"
                                               "cp_wrm_slp", "n_wrm", "n_draw", "n_rp",
                                               "n_bar",   "n_copy",   "n_disp"};
 std::atomic<uint64_t> g_cpu_zone_ns[kCpuZones];
+// Interval accumulators for the on-console profile report (switch_perf.cpp). They are summed whether or not
+// the autotest is running, and taken (zeroed) by rex_autotest_take_interval every 10 s.
+std::atomic<uint64_t> g_iv_gpu_frames{0};
+std::atomic<uint64_t> g_iv_gpu_busy_us{0};
+std::atomic<uint64_t> g_iv_gpu_span_us{0};
+std::atomic<uint64_t> g_iv_gpu_pass_us[kGpuPasses];
+std::atomic<uint64_t> g_iv_cpu_zone_ns[kCpuZones];
 }  // namespace
 
 extern "C" void rex_autotest_cpu_add(uint32_t zone, uint64_t ns) {
   if (zone < kCpuZones) {
     g_cpu_zone_ns[zone].fetch_add(ns, std::memory_order_relaxed);
+    g_iv_cpu_zone_ns[zone].fetch_add(ns, std::memory_order_relaxed);
   }
 }
 
@@ -94,14 +102,37 @@ extern "C" int rex_autotest_owns_stdout(void) {
 extern "C" void rex_autotest_gpu_frame(uint64_t busy_ns, uint64_t span_ns) {
   g_gpu_busy_us.store(busy_ns / 1000, std::memory_order_relaxed);
   g_gpu_span_us.store(span_ns / 1000, std::memory_order_relaxed);
+  g_iv_gpu_frames.fetch_add(1, std::memory_order_relaxed);
+  g_iv_gpu_busy_us.fetch_add(busy_ns / 1000, std::memory_order_relaxed);
+  g_iv_gpu_span_us.fetch_add(span_ns / 1000, std::memory_order_relaxed);
 }
 
 extern "C" void rex_autotest_gpu_passes(const uint64_t* ns, uint32_t count, uint64_t markers) {
   for (uint32_t c = 0; c < kGpuPasses && c < count; ++c) {
     g_gpu_pass_us[c].store(ns[c] / 1000, std::memory_order_relaxed);
+    g_iv_gpu_pass_us[c].fetch_add(ns[c] / 1000, std::memory_order_relaxed);
   }
   g_gpu_pass_markers.store(markers, std::memory_order_relaxed);
   g_gpu_passes_seen.store(true, std::memory_order_relaxed);
+}
+
+// Profile report (switch_perf.cpp, every 10 s): takes and zeroes the interval accumulators.
+// Layout of out[]: [0] GPU frames measured, [1] GPU busy us, [2] GPU span us, [3..12] GPU us per pass
+// (kGpuPasses = 10: other, draw, rt_xfer, res_clear, dump, resolve, readback, tex_load, upload, swap),
+// [13..27] CPU zones in ns (kCpuZones = 15, same order as kCpuZoneNames; n_* are counts x 1e6).
+extern "C" void rex_autotest_take_interval(uint64_t* out, uint32_t cap) {
+  if (out == nullptr || cap < 28) {
+    return;
+  }
+  out[0] = g_iv_gpu_frames.exchange(0, std::memory_order_relaxed);
+  out[1] = g_iv_gpu_busy_us.exchange(0, std::memory_order_relaxed);
+  out[2] = g_iv_gpu_span_us.exchange(0, std::memory_order_relaxed);
+  for (uint32_t c = 0; c < kGpuPasses; ++c) {
+    out[3 + c] = g_iv_gpu_pass_us[c].exchange(0, std::memory_order_relaxed);
+  }
+  for (uint32_t c = 0; c < kCpuZones; ++c) {
+    out[13 + c] = g_iv_cpu_zone_ns[c].exchange(0, std::memory_order_relaxed);
+  }
 }
 
 // Vblank thread (GraphicsSystem::MarkVblank): the clock of --at-clock=vblank.

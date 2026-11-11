@@ -49,6 +49,11 @@
 
 #include <switch.h>
 
+#include "../core/threading_switch.h"
+// core/autotest.cpp: per-interval GPU/CP accumulators (layout documented there), 28 values.
+extern "C" void rex_autotest_take_interval(uint64_t* out, uint32_t cap);
+// graphics/vulkan/command_processor.cpp: render pass ends by call site (address, count pairs), zeroes them.
+extern "C" uint32_t rex_cp_take_rp_sites(uint64_t* out, uint32_t cap_pairs);
 #include "rex/ui/switch_apm.h"
 #include "rex/ui/switch_saltynx.h"
 #include "rex/ui/switch_sysclk.h"
@@ -161,6 +166,18 @@ Sample g_samples[kMaxSamples];
 size_t g_sample_count = 0;
 
 std::atomic<u64> g_counters[kCounterCount];
+// Frame-time histogram (time between presents): <=18, <=25, <=35, <=50, >50 ms, plus the total in us.
+std::atomic<u64> g_frame_buckets[5];
+std::atomic<u64> g_frame_us_sum{0};
+std::atomic<u64> g_present_last_tick{0};
+// Fast (<=18 ms) vs slow frames: what each class did. Counter ids: 5 draws, 14 texture loads, 9 resolves,
+// 7 submits, 15 shared memory bytes uploaded, 13 transfer draws. Written by the command processor thread at
+// each present, read and zeroed by the report.
+constexpr unsigned kSplitIds[6] = {5, 14, 9, 7, 15, 13};
+std::atomic<u64> g_split_frames[2];
+std::atomic<u64> g_split_sum[2][6];
+u64 g_split_prev[6];
+bool g_split_have_prev = false;
 
 /*
  * Wrapped libnx calls (see the file header): how many, how much time inside and, where it makes
@@ -495,6 +512,96 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                                               : "untested"),
                 double(counters_now[20] - counters_last[20]) / seconds,
                 double(counters_now[19] - counters_last[19]) / seconds);
+  // Heap trend, every 10 s, from a normal thread (no malloc probe here): shows whether the heap is
+  // filling up before a crash, and whether the sbrk break stops short of the window.
+  {
+    char heap_line[256];
+    RexSwitchDescribeHeap(heap_line, sizeof(heap_line), /*probe_largest=*/false);
+    std::fprintf(f, "     heap: %s\n", heap_line);
+  }
+  // Frame-time histogram of this interval (and reset): how many frames fit in one vblank (<=18 ms), in
+  // two (25-35 ms), etc. A pile in 25-35 with a tail in <=18 means frames that just miss 16.7 ms.
+  {
+    u64 b[5];
+    u64 n = 0;
+    for (int i = 0; i < 5; ++i) {
+      b[i] = g_frame_buckets[i].exchange(0, std::memory_order_relaxed);
+      n += b[i];
+    }
+    const u64 us = g_frame_us_sum.exchange(0, std::memory_order_relaxed);
+    if (n > 0) {
+      std::fprintf(f,
+                   "     frame times (%llu frames, mean %.1f ms): <=18 ms %.0f%% | 18-25 ms %.0f%% | 25-35 ms %.0f%% | "
+                   "35-50 ms %.0f%% | >50 ms %.0f%%\n",
+                   (unsigned long long)n, double(us) / double(n) / 1000.0, 100.0 * double(b[0]) / double(n),
+                   100.0 * double(b[1]) / double(n), 100.0 * double(b[2]) / double(n),
+                   100.0 * double(b[3]) / double(n), 100.0 * double(b[4]) / double(n));
+    }
+  }
+  {
+    static const char* const kName[2] = {"fast (<=18 ms)", "slow (>18 ms)"};
+    for (int cls = 0; cls < 2; ++cls) {
+      u64 n = g_split_frames[cls].exchange(0, std::memory_order_relaxed);
+      u64 v[6];
+      for (int k = 0; k < 6; ++k) {
+        v[k] = g_split_sum[cls][k].exchange(0, std::memory_order_relaxed);
+      }
+      if (n > 0) {
+        const double d = double(n);
+        std::fprintf(f,
+                     "     %s frames: %llu | per frame: %.1f draws, %.1f texture loads, %.1f resolves, %.1f submits, "
+                     "%.2f MB shared memory uploaded, %.1f transfer draws\n",
+                     kName[cls], (unsigned long long)n, double(v[0]) / d, double(v[1]) / d, double(v[2]) / d,
+                     double(v[3]) / d, double(v[4]) / d / 1048576.0, double(v[5]) / d);
+      }
+    }
+  }
+  // Where a frame goes (averages over the interval): GPU time by pass from the timestamp probe
+  // (gpu_submission_timestamps) and the command-processor thread's CPU zones.
+  {
+    uint64_t v[28] = {};
+    rex_autotest_take_interval(v, 28);
+    const double gf = double(v[0]);
+    const double pf = double(counters_now[0] - counters_last[0]);
+    if (gf > 0.0) {
+      static const char* const kPass[10] = {"other", "draw", "rt_xfer", "res_clear", "dump",
+                                            "resolve", "readback", "tex_load", "upload", "swap"};
+      std::fprintf(f, "     GPU per frame over %.0f frames (ms): busy %.2f, span %.2f |", gf,
+                   double(v[1]) / gf / 1000.0, double(v[2]) / gf / 1000.0);
+      for (int i = 0; i < 10; ++i) {
+        std::fprintf(f, " %s %.2f%s", kPass[i], double(v[3 + i]) / gf / 1000.0, i == 9 ? "\n" : ",");
+      }
+    } else {
+      std::fprintf(f, "     GPU per frame: no timestamp data (gpu_submission_timestamps off or the GPU is behind)\n");
+    }
+    if (pf > 0.0) {
+      const auto ms = [&](int zone) { return double(v[13 + zone]) / pf / 1e6; };  // ns -> ms per frame
+      const auto cnt = [&](int zone) { return double(v[13 + zone]) / pf / 1e6; };  // n_* add 1e6 ns per event
+      std::fprintf(f,
+                   "     CP per frame (ms): idle %.2f, fence wait %.2f, submit %.2f, textures %.2f, WAIT_REG_MEM %.2f "
+                   "(sleeping %.2f) | per frame: %.1f texture loads in %.1f batches (%.1f skipped by hash), %.1f waits, "
+                   "%.1f draws, %.1f render passes, %.1f barriers, %.1f copies, %.1f dispatches\n",
+                   ms(0), ms(1), ms(2), ms(3), ms(7), ms(8), cnt(4), cnt(5), cnt(6), cnt(9), cnt(10), cnt(11),
+                   cnt(12), cnt(13), cnt(14));
+    }
+  }
+  {
+    uint64_t sites[2 * 16];
+    const uint32_t n = rex_cp_take_rp_sites(sites, 16);
+    const double presents = double(counters_now[0] - counters_last[0]);
+    if (n > 0 && presents > 0.0) {
+      std::fprintf(f, "     render pass ends per frame by caller:");
+      for (uint32_t i = 0; i < n; ++i) {
+        if (sites[2 * i] < 4096) {
+          std::fprintf(f, " site%llu x%.1f", (unsigned long long)sites[2 * i], double(sites[2 * i + 1]) / presents);
+        } else {
+          std::fprintf(f, " image+0x%llx x%.1f", (unsigned long long)(sites[2 * i] - g_base),
+                       double(sites[2 * i + 1]) / presents);
+        }
+      }
+      std::fprintf(f, "\n");
+    }
+  }
   // Work the game sends to the GPU, per presented frame. One screen is
   // 1280x720 = 921,600 pixels.
   const auto delta = [&](unsigned id) { return double(counters_now[id] - counters_last[id]); };
@@ -1278,6 +1385,28 @@ void RexSwitchPerfCount(unsigned id) {
     g_counters[id].fetch_add(1, std::memory_order_relaxed);
   }
   if (id == 0) {
+    // Frame-time histogram (report every 10 s): time between two presents, in buckets around the 60 Hz
+    // vblank multiples, so a frame that just misses 16.7 ms and waits for the next vblank (33 ms) is seen.
+    const u64 now = armGetSystemTick();
+    const u64 last = g_present_last_tick.exchange(now, std::memory_order_relaxed);
+    if (last != 0) {
+      const u64 dt_us = (now - last) * 1000000ull / armGetSystemTickFreq();
+      const unsigned b = dt_us <= 18000 ? 0 : dt_us <= 25000 ? 1 : dt_us <= 35000 ? 2 : dt_us <= 50000 ? 3 : 4;
+      g_frame_buckets[b].fetch_add(1, std::memory_order_relaxed);
+      g_frame_us_sum.fetch_add(dt_us, std::memory_order_relaxed);
+      if (g_split_have_prev) {
+        const unsigned cls = dt_us <= 18000 ? 0 : 1;
+        g_split_frames[cls].fetch_add(1, std::memory_order_relaxed);
+        for (unsigned k = 0; k < 6; ++k) {
+          const u64 now_v = g_counters[kSplitIds[k]].load(std::memory_order_relaxed);
+          g_split_sum[cls][k].fetch_add(now_v - g_split_prev[k], std::memory_order_relaxed);
+        }
+      }
+    }
+    for (unsigned k = 0; k < 6; ++k) {
+      g_split_prev[k] = g_counters[kSplitIds[k]].load(std::memory_order_relaxed);
+    }
+    g_split_have_prev = true;
     // Counter 0 is presents. The console overlay clears the "alive" mark and the resolution mark and
     // only waits 100 ms, so it has to be answered on every frame, not once per second. It is writing a
     // few bytes to shared memory.

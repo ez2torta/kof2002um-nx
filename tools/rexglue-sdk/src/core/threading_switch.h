@@ -188,6 +188,13 @@ int RexSwitchCurrentCore(void);
  */
 void RexSwitchDescribeThreadFailure(size_t stack_size, char* out, size_t out_len);
 
+/*
+ * One line with the heap state for the logs: its size (loader override or __nx_heap_size), what mallinfo
+ * sees (arena, in use, free, free chunks, largest free block) and the process memory the kernel reports.
+ * Cheap; meant for startup and for the path that is about to fail on an allocation.
+ */
+void RexSwitchDescribeHeap(char* out, size_t out_len, bool probe_largest);
+
 #ifdef __cplusplus
 }
 #endif

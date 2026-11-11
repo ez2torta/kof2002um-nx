@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <mutex>
@@ -66,6 +68,18 @@ REXCVAR_DEFINE_INT32(perf_skip_mask, 0, "GPU",
 extern "C" void RexSwitchPerfSetFixedSkip(unsigned mask);
 #endif
 
+REXCVAR_DEFINE_BOOL(layer_draw_bbox, false, "GPU/Vulkan",
+                    "Game-specific (kof2002um): the 640x448 8-bit indexed layer draws (pixel shader 608256F8F99FE9DF, "
+                    "~30 per frame, ~2% non-zero pixels, index 0 transparent) only cover the bounding box of their "
+                    "non-zero indices instead of the whole render target");
+REXCVAR_DEFINE_STRING(diag_skip_ps, "", "GPU",
+                      "Diagnostic: comma-separated hex pixel shader ucode hashes (16 digits) whose draw command is not "
+                      "recorded (state, render pass and barriers still are). To measure what a family of draws costs "
+                      "and how the picture looks without it");
+REXCVAR_DEFINE_BOOL(diag_draw_pass_split, false, "GPU",
+                    "Diagnostic (kof2002um): label each draw family with its own GPU pass category so the per-frame "
+                    "GPU report splits them: ps36D6 sprites -> dump, ps6082 atlas sprites -> readback, ps03B1/ps7238 "
+                    "sprites -> tex_load, ps7ABD/psD104 post-process passes -> upload, the rest stays draw");
 REXCVAR_DEFINE_INT32(diag_draw_log_from, -1, "GPU",
                      "Diagnostic: printf one [dd] line per draw from this frame (g_texture_poll_frame). "
                      "-1 = off");
@@ -119,6 +133,59 @@ extern "C" void rex_autotest_gpu_frame(uint64_t busy_ns, uint64_t span_ns);
 extern "C" void rex_autotest_gpu_passes(const uint64_t* ns, uint32_t count, uint64_t markers);
 // CPU time per frame for the cp_* zones (1 = cp_fence, 2 = cp_submit).
 extern "C" void rex_autotest_cpu_add(uint32_t zone, uint64_t ns);
+// [dd] lines (diag_draw_log): to stdout (nxlink) and to the file log, which is the one that can be downloaded
+// from the console over FTP.
+static void DdPrint(const char* fmt, ...) {
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  size_t n = std::strlen(buf);
+  while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
+    buf[--n] = '\0';
+  }
+  std::fputs(buf, stdout);
+  std::fputc('\n', stdout);
+  REXGPU_INFO("{}", buf);
+}
+
+// Render pass ends by call site (return address of EndRenderPass, or a small site id for the direct ends), for the
+// on-console report: tells which caller keeps cutting render passes. Written by the command processor thread, taken by
+// the report thread every 10 s.
+namespace {
+struct RpSite {
+  uintptr_t addr;
+  uint32_t count;
+};
+RpSite g_rp_sites[24];
+uint32_t g_rp_site_count = 0;
+std::mutex g_rp_mutex;
+void NoteRenderPassEnd(uintptr_t site) {
+  std::lock_guard<std::mutex> lock(g_rp_mutex);
+  for (uint32_t i = 0; i < g_rp_site_count; ++i) {
+    if (g_rp_sites[i].addr == site) {
+      ++g_rp_sites[i].count;
+      return;
+    }
+  }
+  if (g_rp_site_count < 24) {
+    g_rp_sites[g_rp_site_count++] = {site, 1};
+  }
+}
+}  // namespace
+extern "C" uint32_t rex_cp_take_rp_sites(uint64_t* out, uint32_t cap_pairs) {
+  std::lock_guard<std::mutex> lock(g_rp_mutex);
+  const uint32_t n = std::min(g_rp_site_count, cap_pairs);
+  for (uint32_t i = 0; i < n; ++i) {
+    out[2 * i] = g_rp_sites[i].addr;
+    out[2 * i + 1] = g_rp_sites[i].count;
+  }
+  g_rp_site_count = 0;
+  return n;
+}
+
+
 namespace {
 // The [gpu-pass] tick calibration (1.0 until it has one): timestamps are in GPU ticks, not ns.
 double g_autotest_ns_per_tick = 1.0;
@@ -4539,6 +4606,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
 
   if (in_render_pass_) {
+    NoteRenderPassEnd(1);  // direct end, site 1
     if (use_dynamic_rendering) {
       deferred_command_buffer_.CmdVkEndRendering();
     } else {
@@ -4613,6 +4681,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
 
   if (in_render_pass_) {
+    NoteRenderPassEnd(2);  // direct end, site 2
     if (use_dynamic_rendering) {
       deferred_command_buffer_.CmdVkEndRendering();
     } else {
@@ -4685,11 +4754,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   in_render_pass_ = true;
 }
 
-void VulkanCommandProcessor::EndRenderPass() {
+__attribute__((noinline)) void VulkanCommandProcessor::EndRenderPass() {
   assert_true(submission_open_);
   if (!in_render_pass_) {
     return;
   }
+  NoteRenderPassEnd(reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
   if (current_render_pass_ == VK_NULL_HANDLE) {
     deferred_command_buffer_.CmdVkEndRendering();
   } else {
@@ -5028,6 +5098,99 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+// kof2002um: the game draws ~30 "layers" per frame as a RectList over the whole 640x448 target, sampling a 640x448
+// k_8 index texture (same address, rewritten by the CPU before each draw) through a 256x1 palette, with an
+// over-blend. Only ~2% of the indices are non-zero. Index 0 is transparent when palette[0] is zero (the blend
+// then leaves the target unchanged), so the draw only has to cover the bounding box of the non-zero indices.
+constexpr uint64_t kIndexedLayerPixelShaderHash = 0x608256F8F99FE9DFull;
+
+// diag_skip_ps: parsed once, on the first draw (the command processor thread only).
+static bool DiagSkipPixelShader(uint64_t hash) {
+  static std::vector<uint64_t> list;
+  static bool parsed = false;
+  if (!parsed) {
+    parsed = true;
+    const std::string text = REXCVAR_GET(diag_skip_ps);
+    size_t pos = 0;
+    while (pos < text.size()) {
+      size_t end = text.find_first_of(", ", pos);
+      if (end == std::string::npos) {
+        end = text.size();
+      }
+      if (end > pos) {
+        list.push_back(std::strtoull(text.substr(pos, end - pos).c_str(), nullptr, 16));
+      }
+      pos = end + 1;
+    }
+  }
+  for (uint64_t h : list) {
+    if (h == hash) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// On true, [x0,x1) x [y0,y1) is the pixel box of the non-zero indices (x1 <= x0 means all zero). The x range is
+// in groups of 8 pixels, which also covers any 8-in-32 / 16-in-16 byte swap of the texture memory.
+template <typename MemoryT>
+static bool ComputeIndexedLayerBBox(const RegisterFile& regs, MemoryT* mem, uint32_t* out_x0, uint32_t* out_y0,
+                                    uint32_t* out_x1, uint32_t* out_y1) {
+  constexpr uint32_t kWidth = 640, kHeight = 448, kWords = kWidth / 8;
+  const xenos::xe_gpu_texture_fetch_t idx = regs.GetTextureFetch(0);
+  const xenos::xe_gpu_texture_fetch_t pal = regs.GetTextureFetch(1);
+  if (uint32_t(idx.format) != 2 || idx.tiled || !idx.base_address || idx.size_2d.width + 1 != kWidth ||
+      idx.size_2d.height + 1 != kHeight || pal.tiled || !pal.base_address || pal.size_2d.width + 1 != 256 ||
+      pal.size_2d.height != 0) {
+    return false;
+  }
+  const uint32_t stride = uint32_t(idx.pitch) << 5;
+  if (stride < kWidth || (stride & 7) != 0) {
+    return false;
+  }
+  const uint32_t* palette = mem->template TranslatePhysical<const uint32_t*>(uint32_t(pal.base_address) << 12);
+  const uint8_t* base = mem->template TranslatePhysical<const uint8_t*>(uint32_t(idx.base_address) << 12);
+  if (!palette || !base || palette[0] != 0) {
+    return false;
+  }
+  uint32_t min_w = kWords, max_w = 0, min_y = kHeight, max_y = 0;
+  for (uint32_t y = 0; y < kHeight; ++y) {
+    const uint64_t* row = reinterpret_cast<const uint64_t*>(base + size_t(y) * stride);
+    uint32_t first = kWords;
+    for (uint32_t w = 0; w < kWords; ++w) {
+      if (row[w]) {
+        first = w;
+        break;
+      }
+    }
+    if (first == kWords) {
+      continue;
+    }
+    uint32_t last = first;
+    for (uint32_t w = kWords - 1; w > first; --w) {
+      if (row[w]) {
+        last = w;
+        break;
+      }
+    }
+    min_w = std::min(min_w, first);
+    max_w = std::max(max_w, last);
+    if (min_y == kHeight) {
+      min_y = y;
+    }
+    max_y = y;
+  }
+  if (min_y == kHeight) {
+    *out_x0 = *out_y0 = *out_x1 = *out_y1 = 0;
+  } else {
+    *out_x0 = min_w * 8;
+    *out_x1 = (max_w + 1) * 8;
+    *out_y0 = min_y;
+    *out_y1 = max_y + 1;
+  }
+  return true;
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -5085,7 +5248,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           }
         }
       }
-      printf("[dd] f%u %s p%u n%u h%u vs%016llX ps%016llX em%u cf%u cb%05X pitch%u msaa%u cm%X z%X "
+      DdPrint("[dd] f%u %s p%u n%u h%u vs%016llX ps%016llX em%u cf%u cb%05X pitch%u msaa%u cm%X z%X "
              "blend%08X%s\n",
              g_texture_poll_frame, stage, prim, count, host_count, (unsigned long long)vs,
              (unsigned long long)ps, uint32_t(mc.edram_mode), uint32_t(ci.color_format),
@@ -5097,7 +5260,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           uint32_t v = r[XE_GPU_REG_PA_CL_VPORT_XSCALE + k];
           std::memcpy(&vp[k], &v, 4);
         }
-        printf("[dd]   cc%08X aref%08X vte%08X wtl%08X wbr%08X sctl%08X sbr%08X vp %.1f %.1f %.1f "
+        DdPrint("[dd]   cc%08X aref%08X vte%08X wtl%08X wbr%08X sctl%08X sbr%08X vp %.1f %.1f %.1f "
                "%.1f\n",
                r[XE_GPU_REG_RB_COLORCONTROL], r[XE_GPU_REG_RB_ALPHA_REF],
                r[XE_GPU_REG_PA_CL_VTE_CNTL], r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
@@ -5105,7 +5268,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                r[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR], vp[0], vp[1], vp[2], vp[3]);
       }
       if (mc.edram_mode == xenos::EdramMode::kCopy) {
-        printf("[dd]   copy ctl%08X dst%08X info%08X pitch%08X clr%08X wtl%08X wbr%08X woff%08X "
+        DdPrint("[dd]   copy ctl%08X dst%08X info%08X pitch%08X clr%08X wtl%08X wbr%08X woff%08X "
                "sctl%08X\n",
                r[XE_GPU_REG_RB_COPY_CONTROL], r[XE_GPU_REG_RB_COPY_DEST_BASE],
                r[XE_GPU_REG_RB_COPY_DEST_INFO], r[XE_GPU_REG_RB_COPY_DEST_PITCH],
@@ -5491,6 +5654,88 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
 
+  if (pixel_shader && prim_type == xenos::PrimitiveType::kRectangleList && index_count == 3 &&
+      pixel_shader->ucode_data_hash() == kIndexedLayerPixelShaderHash) {
+    if (ddiag.regs) {
+      // Diagnostic: the 3 vertices of the layer draw (position / uv mapping), as floats.
+      const Shader::ConstantRegisterMap& vmap = vertex_shader->constant_register_map();
+      for (uint32_t i = 0; i < rex::countof(vmap.vertex_fetch_bitmap); ++i) {
+        uint32_t bits = vmap.vertex_fetch_bitmap[i];
+        uint32_t j;
+        if (rex::bit_scan_forward(bits, &j)) {
+          const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(i * 32 + j);
+          const uint32_t* v = memory_->template TranslatePhysical<const uint32_t*>(uint32_t(vf.address) << 2);
+          if (v) {
+            const uint32_t n = std::min<uint32_t>(vf.size, 24);
+            char buf[512];
+            int len = snprintf(buf, sizeof(buf), "[dd]   layer vtx fetch%u addr%08X size%u:", i * 32 + j,
+                               uint32_t(vf.address), uint32_t(vf.size));
+            for (uint32_t k = 0; k < n && len < int(sizeof(buf)) - 16; ++k) {
+              const uint32_t sw = __builtin_bswap32(v[k]);
+              float f;
+              std::memcpy(&f, &sw, 4);
+              len += snprintf(buf + len, sizeof(buf) - len, " %g", f);
+            }
+            DdPrint("%s", buf);
+          }
+          break;
+        }
+      }
+    }
+    if (REXCVAR_GET(layer_draw_bbox)) {
+      uint32_t bx0, by0, bx1, by1;
+      if (ComputeIndexedLayerBBox(regs, memory_, &bx0, &by0, &bx1, &by1)) {
+        const VkRect2D cur = dynamic_scissor_;
+        int32_t x0 = std::max<int32_t>(cur.offset.x, int32_t(bx0 * draw_resolution_scale_x));
+        int32_t y0 = std::max<int32_t>(cur.offset.y, int32_t(by0 * draw_resolution_scale_y));
+        int32_t x1 = std::min<int32_t>(cur.offset.x + int32_t(cur.extent.width), int32_t(bx1 * draw_resolution_scale_x));
+        int32_t y1 = std::min<int32_t>(cur.offset.y + int32_t(cur.extent.height), int32_t(by1 * draw_resolution_scale_y));
+        VkRect2D r;
+        if (x1 > x0 && y1 > y0) {
+          r.offset.x = x0;
+          r.offset.y = y0;
+          r.extent.width = uint32_t(x1 - x0);
+          r.extent.height = uint32_t(y1 - y0);
+        } else {
+          // All indices zero: one transparent pixel, nothing changes in the target.
+          r.offset = cur.offset;
+          r.extent.width = 1;
+          r.extent.height = 1;
+        }
+        SetScissor(r);
+        if (ddiag.regs) {
+          DdPrint("[dd]   layer bbox x%u-%u y%u-%u -> scissor %d,%d %ux%u", bx0, bx1, by0, by1, r.offset.x,
+                  r.offset.y, r.extent.width, r.extent.height);
+        }
+      }
+    }
+  }
+
+  // diag_draw_pass_split: the GPU pass category this draw is timed under.
+  DeferredCommandBuffer::PassCategory draw_pass_category = DeferredCommandBuffer::PassCategory::kDraw;
+  if (pixel_shader && REXCVAR_GET(diag_draw_pass_split)) {
+    switch (pixel_shader->ucode_data_hash()) {
+      case 0x36D6E98AD80CB14Cull:
+        draw_pass_category = DeferredCommandBuffer::PassCategory::kDump;
+        break;
+      case 0x608256F8F99FE9DFull:
+        draw_pass_category = DeferredCommandBuffer::PassCategory::kReadback;
+        break;
+      case 0x03B1CA02E2878307ull:
+      case 0x72388BBF02B907C1ull:
+        draw_pass_category = DeferredCommandBuffer::PassCategory::kTextureLoad;
+        break;
+      case 0x7ABDFEFBCADB4BF9ull:
+      case 0xD1048F8A2AB44432ull:
+        draw_pass_category = DeferredCommandBuffer::PassCategory::kUpload;
+        break;
+      default:
+        break;
+    }
+  }
+
+  const bool diag_skip_draw = pixel_shader && DiagSkipPixelShader(pixel_shader->ucode_data_hash());
+
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
 
   // Whether to load the guest 32-bit (usually big-endian) vertex index
@@ -5691,9 +5936,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
-    deferred_command_buffer_.MarkPass(DeferredCommandBuffer::PassCategory::kDraw);
+    deferred_command_buffer_.MarkPass(draw_pass_category);
 #if REX_PLATFORM_SWITCH
-    if (!RexSwitchPerfSkip(1))
+    if (!RexSwitchPerfSkip(1) && !diag_skip_draw)
 #endif
     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
   } else {
@@ -5726,9 +5971,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
-    deferred_command_buffer_.MarkPass(DeferredCommandBuffer::PassCategory::kDraw);
+    deferred_command_buffer_.MarkPass(draw_pass_category);
 #if REX_PLATFORM_SWITCH
-    if (!RexSwitchPerfSkip(1))
+    if (!RexSwitchPerfSkip(1) && !diag_skip_draw)
 #endif
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);

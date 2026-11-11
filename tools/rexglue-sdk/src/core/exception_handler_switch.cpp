@@ -82,6 +82,8 @@
 
 #include <switch.h>
 
+#include <rex/system/thread_state.h>
+
 #include "guest_memory_switch.h"
 #include "resume_ctx.h"
 #include "rex_decode.h"
@@ -573,6 +575,15 @@ extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump*
     Append(b, "lr 0x%016" PRIx64 " = image+0x%" PRIx64 "\n", ctx->lr.x, ctx->lr.x - base);
     Append(b, "esr 0x%08x (EC 0x%02x)  far 0x%016" PRIx64 "  error_desc 0x%x  pstate 0x%08x\n",
            esr, esr >> 26, ctx->far.x, ctx->error_desc, ctx->pstate);
+    // The last guest indirect-call target of the faulting thread (REX_CALL_INDIRECT_FUNC stores it
+    // on every call). If the crash jumps to a value that is not this target, the jump came from
+    // somewhere else (a bad return, or a dispatch-table entry that was already wrong).
+    if (auto* ts = rex::runtime::ThreadState::Get()) {
+      Append(b, "last guest indirect call target (this thread): 0x%08x\n",
+             ts->context()->last_indirect_target);
+    } else {
+      Append(b, "last guest indirect call target: no bound thread state\n");
+    }
     if (QueryReadable(pc, 4, &mi) && (mi.perm & Perm_X)) {
       Append(b, "instruction 0x%08x\n", *reinterpret_cast<const uint32_t*>(pc));
     }

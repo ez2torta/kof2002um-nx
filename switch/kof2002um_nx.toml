@@ -22,6 +22,16 @@ vulkan_sparse_shared_memory = false
 vulkan_submit_min_interval_us = 2000
 cp_pin_core = 1
 cp_idle_spin_us = 300
+
+# Licencia: bit 0 = juego comprado (XamContentGetLicenseMask). Sin esto el juego se queda en demo.
+license_mask = 1
+
+# Transferencias de render targets: el juego limpia toda la EDRAM con un clear gigante de profundidad 4x y despues
+# dibuja en 1x encima; copiar esa profundidad hacia los targets de color/profundidad 1x es trabajo inutil
+# (8,8 ms -> 0,15 ms por frame en portatil). Validado jugando sin problemas graficos.
+rt_xfer_skip_depth_to_color = true
+rt_xfer_skip_clear_like_depth = true
+
 [log]
 to_file = true
 level = "debug"

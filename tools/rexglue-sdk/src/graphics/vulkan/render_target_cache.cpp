@@ -82,6 +82,17 @@ REXCVAR_DEFINE_BOOL(vulkan_skip_overwritten_depth_transfers, true, "GPU/Vulkan",
                     "Switch: skip render target transfers into a depth render target when the "
                     "draw is a depth-only rect list that overwrites all of depth and stencil")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(rt_xfer_skip_clear_like_depth, false, "GPU/Vulkan",
+                    "Switch (kof2002um): relax vulkan_skip_overwritten_depth_transfers: also for color+depth draws, and "
+                    "even after the guest has used stencil once (a clear-like rect list with z always + z write and "
+                    "no stencil enabled). The destination keeps its previous stencil bits instead of the transferred ones")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(rt_xfer_skip_depth_to_color, false, "GPU/Vulkan",
+                    "Switch (kof2002um): skip render target transfers whose source is a depth render target and "
+                    "whose destination is a color one. The game clears all of EDRAM with a big 4x depth clear and "
+                    "then draws 1x on top, so the reinterpreted depth bits are garbage the next draw overwrites; "
+                    "the color target keeps its previous host contents instead")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 #endif
 
 REXCVAR_DEFINE_BOOL(resolve_copy_to_texture, true, "GPU/Vulkan",
@@ -277,12 +288,17 @@ bool g_depth_overwrite_draw = false;
 uint64_t g_depth_overwrite_skipped = 0;        // transfers in this 4 s period
 uint64_t g_depth_overwrite_skipped_tiles = 0;  // tiles in this 4 s period
 uint64_t g_depth_overwrite_skipped_total = 0;
+uint64_t g_depth_to_color_skipped = 0;        // transfers skipped in this 4 s period
+uint64_t g_depth_to_color_skipped_tiles = 0;
 
 bool RtXferIsDepthOverwriteDraw(const RegisterFile& regs, reg::RB_DEPTHCONTROL dc) {
   if (!REXCVAR_GET(vulkan_skip_overwritten_depth_transfers)) {
     return false;
   }
-  if (regs.Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kDepthOnly) {
+  const bool relaxed = REXCVAR_GET(rt_xfer_skip_clear_like_depth);
+  const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  if (edram_mode != xenos::EdramMode::kDepthOnly &&
+      !(relaxed && edram_mode == xenos::EdramMode::kColorDepth)) {
     return false;
   }
   if ((regs[XE_GPU_REG_VGT_DRAW_INITIATOR] & 0x3F) !=
@@ -294,7 +310,7 @@ bool RtXferIsDepthOverwriteDraw(const RegisterFile& regs, reg::RB_DEPTHCONTROL d
   }
   if (!dc.stencil_enable) {
     // The old stencil would have to survive the draw.
-    return !g_guest_stencil_used;
+    return relaxed ? true : !g_guest_stencil_used;
   }
   if (dc.stencilfunc != xenos::CompareFunction::kAlways ||
       dc.stencilzpass != xenos::StencilOp::kReplace ||
@@ -370,6 +386,10 @@ void RtTransferStatsCall(bool any) {
       double(total_tiles) / seconds, sorted.size(), g_stencil_bits_skipped,
       g_stencil_bits_skipped_total, g_guest_stencil_used ? "USED" : "never",
       g_depth_overwrite_skipped, g_depth_overwrite_skipped_tiles, g_depth_overwrite_skipped_total);
+  REXGPU_INFO("[rt-xfer] depth->color transfers skipped (rt_xfer_skip_depth_to_color): {} transfers, {} tiles",
+              g_depth_to_color_skipped, g_depth_to_color_skipped_tiles);
+  g_depth_to_color_skipped = 0;
+  g_depth_to_color_skipped_tiles = 0;
   g_depth_overwrite_skipped = 0;
   g_depth_overwrite_skipped_tiles = 0;
   const size_t shown = std::min<size_t>(sorted.size(), 12);
@@ -5411,6 +5431,28 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       filtered_transfers[i] = render_target_transfers[i];
     }
     render_target_transfers = filtered_transfers;
+  }
+  // rt_xfer_skip_depth_to_color: drop the transfers from a depth source into a color destination.
+  static std::vector<Transfer> dc_filtered[1 + xenos::kMaxColorRenderTargets];
+  if (REXCVAR_GET(rt_xfer_skip_depth_to_color) && render_target_transfers && !resolve_clear_rectangle &&
+      render_target_count <= 1 + xenos::kMaxColorRenderTargets) {
+    bool any_dropped = false;
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      dc_filtered[i].clear();
+      const bool dest_color = render_targets[i] && !render_targets[i]->key().is_depth;
+      for (const Transfer& t : render_target_transfers[i]) {
+        if (dest_color && t.source && t.source->key().is_depth) {
+          any_dropped = true;
+          ++g_depth_to_color_skipped;
+          g_depth_to_color_skipped_tiles += t.end_tiles > t.start_tiles ? t.end_tiles - t.start_tiles : 0;
+          continue;
+        }
+        dc_filtered[i].push_back(t);
+      }
+    }
+    if (any_dropped) {
+      render_target_transfers = dc_filtered;
+    }
   }
   if (render_target_transfers) {
     uint64_t transfers = 0;

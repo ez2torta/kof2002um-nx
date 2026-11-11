@@ -31,6 +31,9 @@
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/window.h>
+#ifdef __SWITCH__
+#include "../core/threading_switch.h"
+#endif
 
 REXCVAR_DEFINE_INT32(vsync_precise_spin_us, 0, "GPU",
                      "Guest vblank timer: sleep until this many microseconds before the next vblank "
@@ -137,6 +140,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
     provider_supports_presentation_ = false;
   }
 
+#ifdef __SWITCH__
+  // Heap state right before the command processor, whose 1 MB default buffer is where the
+  // Switch build has died with std::bad_alloc. Both to stdout (nxlink) and the file log.
+  {
+    char heap_line[256];
+    RexSwitchDescribeHeap(heap_line, sizeof(heap_line), /*probe_largest=*/true);
+    REXGPU_INFO("[heap] before command processor: {}", heap_line);
+    printf("[heap] before command processor: %s\n", heap_line);
+  }
+#endif
   // Create command processor. This will spin up a thread to process all
   // incoming ringbuffer packets.
   command_processor_ = CreateCommandProcessor();

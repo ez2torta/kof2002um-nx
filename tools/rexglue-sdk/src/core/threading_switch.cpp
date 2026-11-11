@@ -25,6 +25,7 @@
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include <cstring>
 #include <mutex>
@@ -400,6 +401,53 @@ void RexSwitchDescribeThreadFailure(size_t stack_size, char* out, size_t out_len
            heap_ok ? "has" : "has NO", block >> 10, heap_total >> 20, size_t(mi.arena) >> 20,
            size_t(mi.uordblks) >> 20, size_t(mi.fordblks) >> 20, size_t(mi.ordblks),
            mirror != nullptr ? "has room" : "is FULL", (long long)threads_now, (long long)threads_cap);
+}
+
+void RexSwitchDescribeHeap(char* out, size_t out_len, bool probe_largest) {
+  if (out == nullptr || out_len == 0) {
+    return;
+  }
+  const struct mallinfo mi = mallinfo();
+  const size_t heap_total = envHasHeapOverride() ? size_t(envGetHeapOverrideSize()) : __nx_heap_size;
+  // How far newlib's sbrk has grown into the heap window (fake_heap_start..fake_heap_end, set by
+  // runtime_switch.cpp). If the break stops well short of the end while malloc runs out, sbrk is the limit.
+  extern char* fake_heap_start;
+  extern char* fake_heap_end;
+  const size_t window = size_t(fake_heap_end - fake_heap_start);
+  const size_t break_used = size_t(static_cast<char*>(sbrk(0)) - fake_heap_start);
+  // Process memory as the kernel counts it (TotalMemorySize is the cap for this process, UsedMemorySize
+  // is what it has mapped). Either can be 0 when the query is not supported; then it prints 0.
+  u64 total_mem = 0;
+  u64 used_mem = 0;
+  svcGetInfo(&total_mem, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+  svcGetInfo(&used_mem, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+  // mallinfo has no "largest free block"; the largest block that can still be allocated is what decides
+  // whether a 1 MB allocation fits, so probe it with a binary search over powers of two (cheap, allocates
+  // and frees each probe).
+  size_t largest = 0;
+  if (probe_largest) {  // a 1 GB malloc probe: only at startup, not on the periodic report
+    for (size_t sz = size_t(1) << 30; sz >= (size_t(64) << 10); sz >>= 1) {
+      void* probe = malloc(sz);
+      if (probe != nullptr) {
+        free(probe);
+        largest = sz;
+        break;
+      }
+    }
+  }
+  char largest_text[32];
+  if (probe_largest) {
+    snprintf(largest_text, sizeof(largest_text), "%zu KB", largest >> 10);
+  } else {
+    snprintf(largest_text, sizeof(largest_text), "not probed");
+  }
+  snprintf(out, out_len,
+           "heap %zu MB (%s), window %zu MB, sbrk break at %zu MB, arena %zu MB, in use %zu MB, "
+           "free %zu MB in %zu chunks, largest power-of-two block %s; process total %llu MB, used %llu MB",
+           heap_total >> 20, envHasHeapOverride() ? "loader override" : "__nx_heap_size",
+           window >> 20, break_used >> 20, size_t(mi.arena) >> 20, size_t(mi.uordblks) >> 20,
+           size_t(mi.fordblks) >> 20, size_t(mi.ordblks), largest_text,
+           (unsigned long long)(total_mem >> 20), (unsigned long long)(used_mem >> 20));
 }
 
 }  // extern "C"
