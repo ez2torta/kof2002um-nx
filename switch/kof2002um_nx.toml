@@ -1,6 +1,6 @@
 gpu_plugin = "xenos"
-gpu_submission_timestamps = true
-present_painted_profile = true
+gpu_submission_timestamps = false
+present_painted_profile = false
 
 # --- build 60fps (2026-11-07): cvars del bench que ganaron ---
 vblank_per_swap = false
@@ -22,6 +22,13 @@ vulkan_sparse_shared_memory = false
 vulkan_submit_min_interval_us = 2000
 cp_pin_core = 1
 cp_idle_spin_us = 300
+main_exclusive_core = 0
+
+# --- build 2026-11-11: shaders especializados, filtro EPX a mano, copias de texturas en un worker ---
+spirv_ps_implicit_lod = true
+spirv_ps_static_state = true
+spirv_ps_epx_hash = 716457010
+texture_cpu_copy_worker_core = 2
 [log]
 to_file = true
 level = "debug"

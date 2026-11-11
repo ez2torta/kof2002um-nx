@@ -1,5 +1,129 @@
 # KOF 2002 UM NX — estado del port
 
+## Copias de texturas por CPU en un worker (`texture_cpu_copy_worker_core=2`): portátil ~59 fps (2026-11-11, noche)
+
+- **Medido antes**: `cp_copy` (las copias de filas + flush de `LoadTextureCpuDirect`) = **2,41 ms de los 3,87 de cp_tex**; ~43 cargas por frame de ~120 KB (~5 MB por frame).
+- **Worker** (`vulkan/texture_cache.cpp`, estado file-static `g_cpu_copy_worker`, porque las texturas se destruyen después de los miembros del cache): el CP encola un `CpuCopyJob` (src, dst, pitches, filas, bitmap, endian). Un hilo fijo a ese núcleo copia; el CP sigue. `VulkanTextureCache::FinishCpuCopies()` espera la cola y hace los `vmaFlushAllocation` en el hilo que llama. Se llama justo antes de `vkQueueSubmit` en `EndSubmission`, en `~VulkanTexture` y en `StopCpuCopyWorker` (desde `~VulkanTextureCache`). La zona `cp_copy` (16) pasa a medir lo que el CP sigue esperando al worker.
+- **Corrupción en la primera versión**: el segundo luchador salía translúcido y mezclado con otro sprite. El juego reescribía el buffer de sprites en RAM guest mientras el worker todavía lo leía (el CP ya había avanzado y el juego lo vio).
+  - **Arreglo**: `rex_texture_cpu_copy_barrier`. El hook del memcpy del juego (`src/recompiler/src/texture_write_hook.cpp`, sub_82726240) lo llama antes de una copia que cambia bytes de una textura polleada, y espera a que el worker termine.
+- **Resultado** (portátil, `_nl_wk2.json` = `_nl_epx.json` + `--texture_cpu_copy_worker_core=2`):
+  - Sin la barrera: 60,2 / 60,2 fps, pero con la imagen corrupta.
+  - **Con la barrera: 58,3 / 59,0 fps (16,96–17,16 ms), imagen correcta** (capturas `pelea`/`pelea2` de los runs 180325 y 180504).
+  - Base epx en la misma tanda: 55,1 / 53,3 fps.
+  - cp_tex 3,6 → 1,4 ms; cp_copy (espera del CP) 0,3 ms. El juego espera al worker ~7 veces por frame, ~0,75 ms por frame (línea `[cpu] game waited…`), y eso se ve como cp_idle 3 → 4 ms.
+- **Barrera por rango** (queda): cada job guarda su rango físico de origen y la barrera espera solo hasta el último job que se solapa (`WaitForSourceRange`; `rex_texture_guest_physical` en `pipeline/texture/cache.cpp`). **Casi no cambia**: 17,5 mil esperas y 1,5 s contra 16,5 mil y 1,7 s. **Los solapamientos son reales**: el juego reescribe la textura de sprites en filas que los jobs pendientes todavía tienen que leer.
+- **Descartado: reclamo por fila** (el juego copia las filas que va a pisar y el worker saltea las reclamadas, con bits atómicos `claimed`/`done` por fila). La barrera del juego quedó barata (0,25 s), pero **33,6–39,4 fps**: cp_wrm 13 ms y cp_copy 1,6. Revertido; queda un comentario en el código.
+- Run final (build de la carpeta, con el cargador conectado): **58,8 fps**, imagen correcta.
+- **Build para la SD**: `switch/kof2002um-nx-20261111/` (NRO + TOML + LEEME + toml.original). El TOML es el de la build 60fps más `main_exclusive_core = 0` y los cuatro cvars nuevos. Sin probar: menús, selección de personajes y dock.
+- **Próximo paso**:
+  1. Que el usuario pruebe la build (menús, selección de personajes, pelea, dock).
+  2. Lo que queda para 60 fijos: la espera del juego al worker (~0,7 ms por frame) y, en el CP, cp_post 2,1 y cp_exec 1,9 ms.
+
+## Filtro EPX traducido a mano (`spirv_ps_epx_hash`); el cuello pasa a ser el CPU del CP (2026-11-11, noche)
+
+- El juego **no tiene opción de filtro** (lo dijo el usuario).
+- **El filtro `2AB44432` es un EPX/Scale2x a la misma resolución.** Decodificado del `[psd]`: con E = centro, A B C / D E F / G H I = vecinos (r10 r4 r3 / r5 r6 r7 / r9 r2 r8; r5 r7 r4 r2 guardados como .wxyz) y r1 = color interpolado:
+  - `res = E`; `res = A` si E≠A, D==A y A==B; `res = C` si E≠C, F==C y C==B; `res = G` si E≠G, D==G y G==H; `res = I` si E≠I, H==I e I==F (gana el último).
+  - Si D.a, E.a y F.a son 0, `res = E`. Salida `oC0 = res × r1`.
+  - c255 = (≠0, 0); se dedujo de la lógica y la imagen sale bien.
+- **`spirv_ps_epx_hash=716457010`** (cvar nuevo, InitOnly; `spirv_translator.cpp` `g_spirv_ps_epx_hash` + `EmitEpxBody`; ganchos en `ProcessExecInstructionBegin/End`, en `ProcessTextureFetchInstruction` (sin predicado) y en `ProcessAluInstruction` (ignora las ALU)): las 9 fetch salen por el camino normal del traductor; las ALU se reemplazan por esa lógica y se escribe en `output_or_var_fragment_data_[0]`, así que el epílogo (alpha test, formato) no cambia. **Imagen correcta** (capturas `pelea` del run 172114).
+- **Medido con timestamps** (`_nl_ts_*.json` = mismas configs con `--gpu_submission_timestamps=true`): `gpu_busy` **epx 11,73 / 12,92**, stat 13,40, statcF (filtro constante) 11,11 ms. **El EPX recupera casi todo el costo del filtro.** Sin timestamps: epx 18,42 / 18,85 / 18,53 contra stat 18,80 / 21,63 ms. Config de la SD: `_nl_epx.json` (stat + epx).
+- Los timestamps sirven más que el total de frame para A/B de GPU (`gpu_busy` varía ~1 ms entre runs, el total ±1,5 ms).
+- **Diagnóstico nuevo (run 173253, epx con timestamps)**: los frames de pelea van de 15,5 a 17,9 ms, **justo en el borde**. Por frame: `gpu_busy` 12,6, `gpu_span` 15,8 (**~3 ms de huecos en la GPU**); CP: idle 2,7, tex 3,1, wrm 1,5, submit 0,65 → **~8,6 ms sin desglosar en el procesamiento de ~100 draws (~85 µs por draw)**. Los 26 % de frames de 2 vblanks tienen el doble de draws (el juego hizo 2 frames en un swap) y cp_wrm ~11,8. (En `perf.csv` los `n_*` están ×1000 y los tiempos en µs.)
+- **Zonas nuevas del CP** (`core/autotest.cpp`, zonas 15–18; macros `REX_CP_ZONE_*` en `vulkan/command_processor.cpp`; ya se usan las 32 zonas del autotest): `cp_draw` = todo IssueDraw; `cp_pre` = desde el inicio hasta RequestTextures; `cp_post` = desde después de UpdateBindings hasta el final; `cp_exec` = `DeferredCommandBuffer::Execute` en el submit.
+- **Medido** (epx, runs del 11/11 ~17:45, 107–112 draws por frame): **cp_draw 8,48 ms** = cp_pre 0,94 + **cp_tex 3,53** + RT Update/ConfigurePipeline 0,57 + system constants/UpdateBindings 0,58 + ~0,8 (UpdateDynamicState y otros) + **cp_post 2,08**. Fuera de IssueDraw: **cp_exec 1,86**, submit 0,74, idle 2,9, wrm 2,7.
+- **Segunda opinión** (agente; la web falló, comparó contra el código de Xenia master): proponía reusar los sets de texturas (TODO de upstream en UpdateBindings) y UBO dinámicos para constantes. **Lo medido la descarta como prioridad**: system constants + bindings son 0,58 ms (~5 µs por draw).
+- **Próximo paso** (por tamaño):
+  1. **cp_tex 3,5**: pasar las copias de las cargas por CPU (`texture_load_cpu_direct`) a un hilo worker; el submit que usa la versión espera a que terminen (idea de la sección del 7/11). Ojo con los núcleos: el proceso tiene 3 (máscara 0x7), main en 0 y CP en 1.
+  2. **cp_post 2,1**: desglosar (RequestRange de shared memory, `SubmitBarriersAndEnterRenderTargetCacheRenderPass`, grabación del draw).
+  3. **cp_exec 1,9**: se paga 2 veces por el deferred command buffer; grabar directo es arriesgado.
+  4. Pasar `spirv_ps_implicit_lod`, `spirv_ps_static_state` y `spirv_ps_epx_hash=716457010` al TOML de la SD.
+
+## Portátil con `stat`: ~53 fps; lo que queda caro es el filtro `2AB44432` (2026-11-11, tarde)
+
+- **Ruido de medición**: la misma config `_nl_stat.json` dio 18,86 / 20,35 / 18,52 ms. El total de frame está cuantizado (16,7 o 33 ms) y con ~55 % de frames pasados por poco, una diferencia de ±1,5 ms entre runs es ruido. **Para A/B chicos hacen falta ≥3 runs por lado, o activar `--gpu_submission_timestamps=true` y comparar `gpu_busy`** (cuesta ~4 %, pero es continuo).
+- Sobre `stat` (ilod + static), con un PS constante en lugar del shader: **filtro `2AB44432` (`_nl_statcF.json`) 17,68 ms / 56,6 fps**; **copia `CADB4BF9` (`_nl_statcD.json`) 19,03 ms, sin ganancia** (static ya arregló las copias). Lo único grande que queda es el filtro (~1–2,5 ms).
+- SPIR-V con static (`_nl_statdd.json`, log `_logs/statdd.log`; histograma con `spvx.py` del scratchpad, sin herramientas de SPIR-V instaladas): el filtro pasa de 89.888 a 88.404 bytes, unas 4.800 instrucciones. Todos sus fetch son de tf0, así que el signo se pliega como constante (el driver lo resuelve), pero en el SPIR-V siguen 18 muestreos y 37 OpSwitch. Pesan la ALU traducida (364 Select, 276 FMul, 118 FOrdEqual) y los predicados (95 SelectionMerge).
+- **`spirv_ps_ieee_mul`** (nuevo cvar InitOnly, `spirv_translator_alu.cpp` `g_spirv_ps_ieee_mul`, se lee en `InitializeShaderStorage`; en el PS saca el select de "0 × x = 0" de SM3): ieee 20,27 / 18,75 / 21,52 ms contra stat 18,86 / 20,35 / 18,52. **No sirve: descartado** (el cvar queda, apagado). NVK seguramente ya abarata ese select.
+- **Próximo paso**:
+  1. Preguntarle al usuario si el juego tiene en sus opciones un filtro de pantalla (suavizado), y si lo quiere: apagarlo ahí es gratis.
+  2. Si no hay opción o lo quiere prendido: reemplazar por hash el PS `2AB44432` por uno hecho a mano (con `spv::Builder`, como `diag_ps_const_hash` en `vulkan/shader.cpp`), traduciendo las ~148 ALU del `[psd]` de `_logs/statdd.log`. Antes, medir con timestamps cuánto pesa exactamente.
+  3. Pasar `spirv_ps_implicit_lod=true` y `spirv_ps_static_state=true` al TOML de la build de la SD.
+
+## Portátil: el límite son los ~105 draws (~13 ms de GPU); diagnóstico de relleno contra costo fijo, a medio hacer (2026-11-11)
+
+- **Queja del usuario**: va bien salvo en impactos de golpes, saltos, poderes y dash (ahí se pone lento). Objetivo: 60 fps estables.
+- **Run base de hoy** (`_nl_pinspin_nots.json`, run `20261111-101638`, log `_logs/base1111.log`): relojes cpu 1020 / **gpu 460,8** / emc 1331 = **portátil**. 914 frames, **45,8 fps**, 79 % de frames pasados; cp_wrm 6,5, cp_tex 3,6, n_draw 99 (p95 122).
+- **Runs skip del 7/11 que no estaban anotados** (portátil, `_nl_skipN.json` = pinspin + `--perf_skip_mask=N`; máscara: 1 draws, 2 transfers, 4 resolves, 8 dispatch de carga de texturas, 16 efecto de presentación):
+  - skip1 (sin draws): **1199 frames = 60,1 fps**, gpu_busy 3,9 ms. Base: 860 frames, gpu_busy 19,5 (gp_draw 13,4, gp_resolve 3,4, gp_rt_xfer 1,7).
+  - skip2: 909 frames (gpu_busy 16,6). skip4: 858 (sin cambio). skip16: 892 (gpu_busy 18,0).
+  - **Conclusión**: los draws del juego son el cuello (~130 µs por draw a 460 MHz). Resolves, transfers y presentación suman poco.
+- En el run base del 7/11, frames rápidos contra lentos: gpu_busy 17,7 contra 21,7 ms, gp_draw 12,2 contra 14,9; n_draw casi igual (106 contra 108). El costo no sigue a la cantidad de draws: apunta a **relleno de píxeles** (efectos con blending grandes), que cuadra con la queja del usuario. Script: `slow.py <perf.csv> <frame_desde>` (scratchpad de la sesión; es corto, se puede rehacer).
+- **Diagnóstico nuevo** (`vulkan/command_processor.cpp`): cvar `diag_draw_tiny_scissor`. 1 = scissor 1x1 en todos los draws del juego (sin relleno, mismo trabajo por draw); otro valor = solo los draws cuyo pixel shader tiene esos 32 bits bajos de hash (decimal con signo). **Build OK** (`_logs/tiny-build.log`, sin errores; `kof2002um-nx/kof2002um-nx.nro` del 11/11 10:22). Todavía no se corrió en la Switch.
+- **Resultado `_nl_tiny1.json`** (run `20261111-102303`, log `_logs/tiny1.log`, portátil gpu 460,8): **1196 frames = 59,9 fps**, total 16,70 ms, n_draw 106,8, cp_tex 2,92, cp_wrm 2,23. Con scissor 1x1 y los mismos draws llega a 60: **el cuello es relleno de píxeles** (pixel shader × área), no el costo fijo por draw. El CP entra en el presupuesto (los 5 peores frames son de ~31 ms con cp_wrm ~16: un vblank perdido suelto).
+- **Draws del frame 1500 por pixel shader** (`_nl_ddlog.json`, log `_logs/ddlog1111.log`; entre paréntesis el valor para `diag_draw_tiny_scissor`):
+  - 44 × `ps…D80CB14C` (-670256820): fondo + HUD, índice 512x512 + paleta 256x1.
+  - 30 × `ps…F99FE9DF` (-106960417): luchadores, índice 640x448 + paleta.
+  - 12 × `ps…02B907C1` (45680577): 128x128 / 512x512 + tabla 128x256.
+  - 5 × `ps…CADB4BF9` (-891597831): composición a pantalla completa de una textura 640x448 k_8888 resuelta (3 opacos, 2 con blend 01610701).
+  - 2 × `ps…2AB44432` (716457010): pantalla completa 640x448 de un resolve (opaco).
+  - 2 × `ps…05D5D69B` (97900187): escalado final a 1280x720 + arte lateral 350x720.
+  - 1 × `ps…89287B99` (clear inicial, msaa2). Los `ps0` son resolves (copias).
+- **Scissor 1x1 por shader** (portátil, base 45,8 fps / 21,8 ms; configs `_nl_tinyA…G.json`; las capturas confirman que el filtro anula justo esos draws):
+  - A fondo + HUD (44 draws): 46,2 fps / 21,66 ms. B luchadores (30): 45,0 / 22,20. C (12): 43,9 / 22,80. **Sin ganancia: los sprites y el fondo no son el relleno caro.**
+  - D composición `CADB4BF9` (5 draws): **50,8 fps / 19,69 ms (−2,1 ms)**. F `2AB44432` (2 draws): **50,7 fps / 19,72 ms (−2,1 ms, ~1 ms por draw)**. E escalado final (2): 47,6 / 21,02 (−0,8 ms). G: falló la conexión, sin dato.
+  - **Conclusión**: los ~5 ms que sobran están en **9 draws de pantalla completa** (D + E + F ≈ 5 ms). ~1 ms por pasada de 640x448 (287 k píxeles) es muchísimo para una copia: o el PS traducido es muy pesado, o el RT real es más grande que 640x448. En golpes/poderes el juego seguramente agrega pasadas de este tipo (flash), lo que cuadra con la queja.
+- **Microcódigo y SPIR-V traducido** (`_logs/ddlog2.log` y `_logs/spv1111.log`; histograma con `spvhist.py` del scratchpad de la sesión, que lee los `[spv]`/`[spx]`):
+  - `CADB4BF9` = `tfetch2D r0, r0.xy, tf0` + `mul oC0, r0, r1` (copia × color). Traducido: **397 instrucciones SPIR-V**, 2 muestreos (unsigned/signed por rama dinámica), 5 OpSwitch, OpKill. `05D5D69B` (`tfetch` + `max oC0, r0, r0`): 388.
+  - `2AB44432` = **filtro de suavizado tipo scale2x/xBR**: 9 tfetch de vecinos + ~148 ALU con predicados. Traducido: **4081 instrucciones**, 18 muestreos, 37 OpSwitch.
+  - Sprites (`D80CB14C`, `F99FE9DF`): ~520–600 instrucciones, pero cubren poca área.
+  - Los 9 draws de pantalla completa llevan `RB_COLORCONTROL=0x8700000C` (alpha test GREATER, ref 0) con depth test+write: `pipeline_cache.cpp` ~1020 elige `kNoModifiers`, así que **no hay early-Z y el OpKill es dinámico**.
+  - Cuenta rápida: ~150 instrucciones de máquina × 287 k píxeles / (256 lanes × 460 MHz) ≈ 0,37 ms por pasada, que coincide con los ~0,4 ms medidos. **Apunta al ALU del prólogo/epílogo traducido**, no al ROP.
+- **Segunda opinión** (agente; la web falló, sin URLs verificadas): especializar alpha test, signo y gamma en la clave del pipeline (estilo XenosRecomp); reemplazar por hash el PS de copia por SPIR-V mínimo; para el filtro, buscar la opción del juego (pantalla original/filtrada) o simplificarlo. Riesgos: más pipelines (tirones de compilación) y hashes que cambian.
+- **Resultado del PS constante** (misma tanda; base `_nl_pinspin_nots` 22,70 ms / 44,0 fps): `cD` (copia → constante) **20,58 ms (−2,1)**, igual que con el scissor 1x1 de esos draws. `cF` (filtro → constante) 20,23 ms (con otra base, ~−2). **El costo de esos draws es el PS traducido** (ALU, muestreo con gradientes y/o late-Z por el OpKill), no el ROP ni el ancho de banda. (Una primera corrida de cD dio 26,9 ms porque se abrió el menú rápido de la Switch: no vale.)
+- **Experimento siguiente**: cvar `spirv_ps_implicit_lod` (`spirv_translator_fetch.cpp`, rama 2D): en los fetch 2D del PS usa LOD implícito + bias en lugar de `textureGrad` con derivadas coarse calculadas (TXD es lento en Maxwell). Config `_nl_ilod.json`.
+- **Ojo con los cvars que afectan la traducción**: `pipeline_cache` traduce al arrancar los shaders guardados (`InitializeShaderStorage`), antes del primer draw. Los flags de traducción se leen ahora en `VulkanCommandProcessor::InitializeShaderStorage` (log `[spvexp]`). El primer run de `ilod` (22,77 ms) no valía por eso.
+- **`spirv_ps_implicit_lod=true`** (run 111600): **21,96 ms contra 22,66 de la base (−0,7 ms)**, imagen correcta.
+- `spirv_no_sample_mask_output` (InitOnly, `vulkan/pipeline_cache.cpp` `Initialize`; traductor con `sample_rate_shading=false`, sin `gl_SampleMask`): run 111926 **23,31 ms contra 21,73 de ilod** en la misma tanda (p95 39). **No sirve: descartado** (el cvar queda, apagado). ilod confirmado: 21,73 ms. El log dice `demote=1`: NVK soporta demote.
+- **El usuario confirmó que nota la lentitud en PORTÁTIL** (2026-11-11). El objetivo es portátil.
+- **`spirv_ps_static_state`** (InitOnly; `vulkan/pipeline_cache.cpp` `GetCurrentPixelShaderModification` + `spirv_translator.h`/`_rb.cpp`/`_fetch.cpp`): bits nuevos en `PixelShaderModification` (`static_state`, `static_alpha_test_function`, `static_color0_no_gamma`, `static_fetch_unsigned_mask` para tf0/tf1). El traductor usa constantes en lugar de leer las constantes de sistema: el alpha test, el PWL de gamma de RT0 y los signos de tf0/tf1 se pliegan en compilación. Los signos salen de `texture_util::SwizzleSigns(fetch)` (la modificación se calcula antes de `RequestTextures`, así que el binding activo sería el del draw anterior).
+  - Run 112717 (`_nl_stat.json` = ilod + static): **18,86 ms / 53,0 fps** (antes ~21,7 con ilod y 22,7 en la base). **−3 ms**, imagen correcta (pelea y pelea2).
+- **Próximo paso** (antes de static faltaban ~5 ms; los 9 draws de pantalla completa son ~4–5 ms y los sprites suman el resto):
+  1. Especializar el PS en la clave de modificación (quedan 15 bits libres en `PixelShaderModification`, `spirv_translator.h` ~74): función de alpha test fija (3 bits), "fetch 0/1 sin signo y sin gamma" (2 bits) y RT0 sin gamma (1 bit). Eso saca del SPIR-V los OpSwitch de signo, el PWL de gamma y el switch dinámico de alpha test. Llenarlos en `pipeline_cache.cpp` `GetCurrentPixelShaderModification` desde los registros y fetch constants. Medir con `cD` y `ilod` como base.
+  2. Si no alcanza: reemplazar por hash el filtro `2AB44432` por un SPIR-V hecho a mano (o ver si el juego tiene una opción de filtro/pantalla original que lo apague).
+  3. Pasar `spirv_ps_implicit_lod=true` al TOML de la build de la SD (ganancia chica, imagen correcta).
+  4. Preguntarle al usuario si nota la lentitud en dock o en portátil.
+- cvar `diag_ps_const_hash=<hash>` (`vulkan/shader.cpp`): reemplaza ese PS por uno de color constante con EarlyFragmentTests (log `[psconst]`). Configs `_nl_cD.json` (copia `CADB4BF9`) y `_nl_cF.json` (filtro `2AB44432`). Si da lo mismo que el scissor 1x1 (19,7 ms), el costo es el shader traducido; si queda cerca de 21,8, es ROP, late-Z o ancho de banda.
+- **Descartado**: swizzle en el shader. NVK no es portability subset, así que `imageViewFormatSwizzle` queda implícito en true (`ui/vulkan/vulkan_device.cpp` ~744).
+- Diag nuevo: con `diag_draw_log_*` activo se imprime una vez por hash el microcódigo desensamblado del PS (líneas `[psd]`).
+- Configs listas: `_nl_tiny1.json` (pinspin_nots + `--diag_draw_tiny_scissor=1`) y `_nl_ddlog.json` (pinspin_nots + `--diag_draw_log_from=1500 --diag_draw_log_to=1500`, para sacar los hashes `ps…` de un frame de pelea).
+- **Segunda opinión** (agente; sin web, leyó el traductor local `graphics/pipeline/shader/`; lo de NVK es de memoria, **sin verificar**):
+  - `spirv_translator_fetch.cpp` ~1891–1999: si `features_.image_view_format_swizzle` es falso, el swizzle va en el shader (UBO + máscaras + ramas por componente), más un `OpSwitch` de signo por componente y muestreo doble unsigned/signed. Con índice + paleta, hasta 8 switches por píxel.
+  - `spirv_translator_rb.cpp` 490–588: alpha test dinámico que termina en `OpKill` (impide early-Z). 590–775: alpha-to-coverage con `gl_SampleMask` si hay `sample_rate_shading`, aun con MSAA 1x. 928: exp bias. 1343: gamma PWL.
+  - Recomienda: (1) revisar que `image_view_format_swizzle` esté activo en NVK, que no haya `gl_FragDepth` y apagar alpha-to-coverage con 1x; (2) especializar el PS por estado (alpha test, signos, swizzle, gamma) como clave de pipeline, estilo XenosRecomp (https://github.com/hedge-dev/XenosRecomp); (3) reemplazar por hash el PS de paleta por SPIR-V a mano; (4) resolución interna menor en portátil si es fill-rate puro.
+- **run-logged.ps1 falla** con este runner (sale en 0 s y sin log). Correr directo desde `devkitnx/`: `python runner/nxtest.py run configs/<cfg>.json --no-build *> "D:\Ports Swtch\_logs\<nombre>.log"` y después `tools/logfilter.ps1`.
+- **Próximo paso**:
+  1. Correr `_nl_tiny1.json` (abrir antes el netloader con sys-botbase): si da ~60 fps, es relleno (pixel shader × píxeles); si sigue en ~45, es costo fijo por draw (vértices, estado).
+  2. Correr `_nl_ddlog.json`, agrupar los `[dd]` por `ps…` y probar `diag_draw_tiny_scissor=<hash>` con los 2–3 shaders más usados para ver cuál pesa.
+  3. Si es relleno: revisar los 3 puntos baratos del agente (swizzle por vista, alpha-to-coverage, `gl_FragDepth`) y después especializar o reemplazar el PS caliente.
+  4. No se sabe si el usuario juega en dock o portátil cuando nota la lentitud: preguntarle. En dock el límite era el CP (sección "CP fijo en el núcleo 1").
+
+## Portátil: ~43 fps, límite GPU; sin timestamps de GPU +4 % (2026-11-07, noche)
+
+- **Timestamps**: con `gpu_submission_timestamps=true` cada `MarkPass` es un `vkCmdWriteTimestamp(BOTTOM_OF_PIPE)`. En la pelea hay ~2 por draw (la traza muestra `[1d21d21d…]`: kDraw/kTransfer alternados). A/B en portátil (`_nl_pinspin_nots.json` contra `_nl_pinspin.json`): **895/890/901 contra 855 frames**. El TOML de `switch/kof2002um-nx-20261107-seleccion/` ya va con `gpu_submission_timestamps = false` y `present_painted_profile = false`; el TOML de la release v0.1.1 se reemplazó por este (verificado bajándolo).
+- **Traza** (`_nl_pinspin_trace.json`, run 155749, f1400): los sprites de la pelea ya van en pocas pasadas largas (`[1d21d…]` de 40 draws). **No hay barreras seguidas** (siempre hay copia, blit o dispatch en medio), así que juntarlas en `SubmitBarriers` no gana. Lo que se repite ~8 veces por frame es el resolve `b5lbi2b` / `b5lbi3b[a2]`: barrera, blit RT → `rtt_swap_image_` (solo para cambiar rojo/azul, `texture_cache.cpp` ~2680), barrera, copia a la textura, barrera. Más una `b8c7bxbu2b` (subida + dispatch + copia a imagen) por submit.
+- **Segunda opinión** (agente; WebSearch falló y leyó el código de Mesa, el fork mesa-switch y deko3d con curl; archivos en el scratchpad de la sesión, carpeta `web/`): en NVK toda barrera con src ≠ NONE/TOP/HOST es WFI y los stages finos no cambian nada. Cada cambio de subcanal (copy engine, compute) drena. Events no sirven. Cortar la pasada es barato en Maxwell (sin tiler); lo caro es la barrera. MR de Mesa en borrador **!38083 "nvk: Use PIXEL_SHADER_BARRIER"** (barrera débil si los dst son solo fragment/color) y **!41057** (menos WFI). deko3d no vale la pena (shaders precompilados). Estimación (sin medir): ~200 serializaciones por frame ≈ 2–4 ms en portátil.
+- **Costo medido de cortes y barreras (portátil)**. Cvar nuevo `diag_draw_break=N` (`vulkan/command_processor.cpp`, después de cada draw): 1 = `EndRenderPass()`; N > 1 = además N−1 barreras vacías COLOR_OUTPUT → FS|COLOR_OUTPUT. Configs `_nl_brk1/2/5.json` (= `_nl_pinspin_nots` + el cvar). Frames y total en ms:
+  - Base: 872 frames / 22,7 ms (n_rp 25, **n_bar 38**: con la config actual ya no son ~120).
+  - brk1 (+80 pasadas): 794 y 825 / 24,6 ms → **~24 µs por corte de pasada** (incluye el vaciado de la GPU).
+  - brk2 (+96 barreras): 779 / 25,5 ms. brk5 (+375 barreras): 778 / 25,6 ms. **Las barreras que siguen a un corte cuestan ~2–9 µs**: la GPU ya está vacía.
+  - **Conclusión**: con ~25 pasadas, 38 barreras, 19 copias y unos 20 dispatches, la serialización suma **~1,5–2 ms de los ~19 ms** de GPU. **No es el cuello principal**: el grueso es el trabajo de los draws y los resolves. Los pasos 2–4 de abajo ganan poco (< 1 ms en total).
+- **Próximo paso** (en orden):
+  1. Ver dónde se va el tiempo de los draws: píxeles por frame (`RexSwitchPerfAdd(6, área del scissor)` ya existe) y costo por tipo de draw, salteando draws con `RexSwitchPerfSkip` (fondos grandes contra sprites). Revisar el pixel shader traducido de los sprites (índice k_8 + paleta): puede ser caro para un GM20B a 384 MHz.
+  2. Resolve con swap rojo/azul sin scratch: blit directo del RT a la textura (el blit convierte por componente) o vista con swizzle. Ahorra un blit y una barrera por resolve.
+  3. Parchear el NVK del SDK con la idea de !38083 (RT → muestreado en PS).
+  4. Atajos de resolve estilo HLE cuando el destino solo lo lee la GPU.
+
 ## Selección de personajes ARREGLADA: las paletas en cero van por shared memory (2026-11-07, noche)
 
 - **Arreglo** (`vulkan/texture_cache.cpp`, `LoadTextureCpuDirect`, después de `TranslatePhysical`): si la textura tiene alto 1 (paleta 256x1) y sus bytes en la RAM del guest son **todos cero**, `fallback()` (camino de shared memory, como vanilla). Cvar `texture_cpu_direct_zero_row_fallback` (default true). Log `[cpu] zero palette @XXXXX 256x1: shared memory path` (8 como máximo; salieron @1827A, @18252, @1822A…).
@@ -7,7 +131,10 @@
 - **Descartado**: excluir de cpu_direct todas las texturas de alto 1 (run 151743): la selección se ve bien, pero la pelea cae a 853 frames (total 23,5 ms, gpu_busy 22,7, **n_copy 50**): las paletas de la pelea se recargan cada frame y por GPU cortan la pasada.
 - Sigue sin saberse **por qué** la RAM del guest tiene ceros y el buffer tiene datos (hipótesis de la sección de abajo). El arreglo imita a vanilla sin resolverlo. Si aparece otra textura negra de alto > 1, retomar el paso 1 de abajo.
 - El cambio `IsRangeGpuWritten` (sección de abajo) sigue en el código.
-- **Próximo paso**: volver al rendimiento (próximo paso de "CP fijo en el núcleo 1"). Ojo: con `_nl_charsel` el gpu_busy da ~20 ms contra ~13 de `_nl_cpuup`; comparar siempre con la misma config.
+- **A/B con `_nl_pinspin.json`** (runs 154244–155230; `_nl_pinspin_old.json` = la NRO de las 01:53 de `switch/kof2002um-nx-60fps/`): nueva 864/871/876/869 frames, vieja 857/863. **Sin regresión.** Las dos dan ~860 frames (≈43 fps, gpu_busy ~19 ms) contra 1040–1125 de la vieja a la madrugada: la batería bajaba (43 → 35 %), y el usuario **confirmó que estaba en portátil**. Primera medida en portátil: **~43 fps** (gp_draw ~14 ms, n_rp ~24, n_copy ~19), el límite es la GPU.
+- Release **v0.1.1** publicada (pre-release, NRO + TOML + NSP); README actualizado. Build suelta en `switch/kof2002um-nx-20261107-seleccion/`.
+- Los runs seguidos fallan a veces con "Connection … failed": después de un run OK hay que esperar ~10 s antes de `click A` y ~8 s más antes de nxlink (script `ab.py` del scratchpad de la sesión).
+- **Próximo paso**: en portátil el límite es la GPU (~19 ms con ~110 draws, o sea ~130 µs por draw: son vaciados de la GPU por barreras y pasadas, no relleno). Bajar pasadas y barreras ayuda en los dos modos (ver la segunda opinión de "Cargas solo de filas sucias": NVK hace WAIT_FOR_IDLE en cada barrera). En dock sigue el CP (próximo paso de "CP fijo en el núcleo 1").
 
 ## Selección de personajes negra: la causa es `texture_load_cpu_direct` (2026-11-07, tarde)
 

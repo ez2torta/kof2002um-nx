@@ -10,6 +10,7 @@
  */
 
 #include <cstdint>
+#include <cstdio>
 
 #include <rex/assert.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -17,6 +18,8 @@
 #include <rex/ui/vulkan/provider.h>
 
 namespace rex::graphics::vulkan {
+
+int32_t g_diag_ps_const_hash = 0;  // set by VulkanCommandProcessor from a cvar
 
 VulkanShader::VulkanTranslation::~VulkanTranslation() {
   if (shader_module_) {
@@ -42,6 +45,36 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
   shader_module_create_info.flags = 0;
   shader_module_create_info.codeSize = translated_binary().size();
   shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(translated_binary().data());
+  // Diagnostic (diag_ps_const_hash): replace the pixel shader with these low
+  // 32 hash bits by a minimal one writing constant magenta with early tests.
+  static const uint32_t kConstPs[] = {
+      0x07230203, 0x00010000, 0, 12, 0,
+      0x00020011, 1,                                      // OpCapability Shader
+      0x0003000E, 0, 1,                                   // OpMemoryModel Logical GLSL450
+      0x0006000F, 4, 1, 0x6E69616D, 0, 2,                 // OpEntryPoint Fragment %1 "main" %2
+      0x00030010, 1, 7,                                   // OriginUpperLeft
+      0x00030010, 1, 9,                                   // EarlyFragmentTests
+      0x00040047, 2, 30, 0,                               // %2 Location 0
+      0x00020013, 3,                                      // %3 void
+      0x00030021, 4, 3,                                   // %4 fn void
+      0x00030016, 5, 32,                                  // %5 float
+      0x00040017, 6, 5, 4,                                // %6 vec4
+      0x00040020, 7, 3, 6,                                // %7 ptr Output vec4
+      0x0004003B, 7, 2, 3,                                // %2 out
+      0x0004002B, 5, 8, 0x3F800000,                       // %8 1.0
+      0x0004002B, 5, 9, 0,                                // %9 0.0
+      0x0007002C, 6, 10, 8, 9, 8, 8,                      // %10 (1,0,1,1)
+      0x00050036, 3, 1, 0, 4,                             // %1 main
+      0x000200F8, 11,                                     // label
+      0x0003003E, 2, 10,                                  // store
+      0x000100FD, 0x00010038};                            // return, end
+  if (g_diag_ps_const_hash != 0 && shader().type() == xenos::ShaderType::kPixel &&
+      int32_t(uint32_t(shader().ucode_data_hash())) == g_diag_ps_const_hash) {
+    shader_module_create_info.codeSize = sizeof(kConstPs);
+    shader_module_create_info.pCode = kConstPs;
+    printf("[psconst] ps%016llX mod%016llX replaced\n",
+           (unsigned long long)shader().ucode_data_hash(), (unsigned long long)modification());
+  }
   if (vulkan_device->functions().vkCreateShaderModule(vulkan_device->device(),
                                                       &shader_module_create_info, nullptr,
                                                       &shader_module_) != VK_SUCCESS) {

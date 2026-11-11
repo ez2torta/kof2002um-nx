@@ -88,6 +88,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // Static render state baked into the shader instead of read from the
+      // system constants (spirv_ps_static_state experiment). Only meaningful
+      // if static_state is set.
+      uint32_t static_state : 1;
+      // Alpha test function (xenos::CompareFunction, kAlways if disabled).
+      uint32_t static_alpha_test_function : 3;
+      // Render target 0 is not converted to gamma in the shader.
+      uint32_t static_color0_no_gamma : 1;
+      // Fetch constants 0 and 1 have all swizzled signs kUnsigned.
+      uint32_t static_fetch_unsigned_mask : 2;
     } pixel;
     uint64_t value = 0;
 
@@ -762,6 +772,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Is currently writing the empty depth-only pixel shader, such as for depth
   // and stencil testing with fragment shader interlock.
   bool is_depth_only_fragment_shader_ = false;
+
+  // Experiment (cvar spirv_ps_epx_hash): the pixel shader is the game's EPX
+  // smoothing filter - keep its texture fetches, drop its predicated ALU code
+  // and emit the equivalent selection logic directly.
+  bool epx_mode_ = false;
+  bool epx_emitted_ = false;
+  void EmitEpxBody();
 
   std::unique_ptr<SpirvBuilder> builder_;
 

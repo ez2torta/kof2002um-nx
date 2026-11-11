@@ -1,0 +1,79 @@
+{
+  "name": "kof2002um-bench",
+  "switch_ip": "192.168.0.137",
+  "nxlink": "D:/Ports Swtch/devkitPro/tools/bin/nxlink.exe",
+  "nro": "../../kof2002um-nx/kof2002um-nx.nro",
+  "upload_path": "kof2002um-nx/kof2002um-nx-at2.nro",
+  "args": [
+    "--autotest=bench",
+    "--perf",
+    "--at-input=sdmc:/switch/kof2002um-nx/bench_input_vb.txt",
+    "--vblank_per_swap=false",
+    "--gpu_submission_timestamps=false",
+    "--at-exit-at-end",
+    "--at-exit-after=30000",
+    "--vblank_per_swap_timeout_ms=20",
+    "--at-clock=vblank",
+    "--wait_reg_mem_log=true",
+    "--texture_load_linear_direct=true",
+    "--gpu_force_msaa_1x_from_2x=true",
+    "--texture_load_cpu_direct=true",
+    "--texture_load_cpu_poll=true",
+    "--gpu_msaa_4x_alias_to_1x=true",
+    "--resolve_copy_to_texture=true",
+    "--resolve_skip_memory_after_copy=true",
+    "--texture_poll_write_hook=true",
+    "--texture_poll_hook_skip_hash=true",
+    "--wait_reg_mem_spin_us=18000",
+    "--vsync_precise_spin_us=300",
+    "--texture_poll_hook_dirty_rows=true",
+    "--shared_memory_cpu_upload=true",
+    "--vulkan_sparse_shared_memory=false",
+    "--at-seed=1",
+    "--vulkan_submit_min_interval_us=2000",
+    "--main_exclusive_core=0",
+    "--cp_pin_core=1",
+    "--cp_idle_spin_us=300", "--spirv_ps_implicit_lod=true", "--spirv_ps_static_state=true", "--diag_ps_const_hash=-891597831"
+  ],
+  "timeout_total": 1200,
+  "budget_ms": 16.667,
+  "perf_from_mark": "match_start",
+  "expect": [
+    {
+      "mark": "boot",
+      "within": 240
+    },
+    {
+      "mark": "first_frame",
+      "within": 180
+    },
+    {
+      "mark": "match_start",
+      "within": 600
+    }
+  ],
+  "sysbotbase": {
+    "enabled": true,
+    "port": 6000,
+    "before_run": [],
+    "open_netloader": false,
+    "netloader_wait": 1.5,
+    "on_mark": {
+      "match_start": [
+        {
+          "wait": 5
+        },
+        {
+          "screenshot": "pelea"
+        },
+        {
+          "wait": 8
+        },
+        {
+          "screenshot": "pelea2"
+        }
+      ]
+    },
+    "on_finish": []
+  }
+}

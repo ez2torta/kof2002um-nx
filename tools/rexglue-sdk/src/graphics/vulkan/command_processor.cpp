@@ -106,6 +106,36 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(diag_draw_break, 0, "GPU/Vulkan",
+                     "Diagnostic: after every draw end the render pass (1), plus N-1 empty "
+                     "pipeline barriers (N > 1), to measure their GPU cost");
+REXCVAR_DEFINE_INT32(diag_draw_tiny_scissor, 0, "GPU/Vulkan",
+                     "Diagnostic: 1 = 1x1 scissor on every guest draw (no fill, same per-draw "
+                     "work); other = only on draws whose pixel shader hash has these low 32 bits "
+                     "(as a signed decimal)");
+// Set in IssueDraw once the pixel shader is known, read where the scissor is set.
+static bool g_diag_tiny_scissor_draw = false;
+REXCVAR_DEFINE_INT32(diag_ps_const_hash, 0, "GPU/Vulkan",
+                     "Diagnostic: replace the pixel shader whose hash has these low 32 bits "
+                     "(signed decimal) by a constant-color one with early fragment tests");
+REXCVAR_DEFINE_BOOL(spirv_ps_implicit_lod, false, "GPU/Vulkan",
+                    "Experiment: 2D texture fetches in pixel shaders use implicit LOD + bias "
+                    "instead of textureGrad with computed derivatives");
+REXCVAR_DEFINE_INT32(spirv_ps_epx_hash, 0, "GPU/Vulkan",
+                     "Experiment: the pixel shader whose hash has these low 32 bits (signed "
+                     "decimal) is the EPX smoothing filter; translate it with direct selection "
+                     "logic instead of its predicated ALU code");
+REXCVAR_DEFINE_BOOL(spirv_ps_ieee_mul, false, "GPU/Vulkan",
+                    "Experiment: pixel shader multiplications skip the Shader Model 3 "
+                    "'0 * anything = 0' emulation (plain IEEE multiply)");
+namespace rex::graphics {
+extern bool g_spirv_ps_implicit_lod;  // spirv_translator_fetch.cpp
+extern bool g_spirv_ps_ieee_mul;      // spirv_translator_alu.cpp
+extern int32_t g_spirv_ps_epx_hash;   // spirv_translator.cpp
+}  // namespace rex::graphics
+namespace rex::graphics::vulkan {
+extern int32_t g_diag_ps_const_hash;  // shader.cpp
+}  // namespace rex::graphics::vulkan
 REXCVAR_DEFINE_BOOL(gpu_submission_timestamps, false, "GPU/Vulkan",
                     "Diagnostic: GPU timestamps at the start and end of every emulated-GPU "
                     "submission; logs GPU busy/idle time per second and per frame every 2 s")
@@ -119,6 +149,26 @@ extern "C" void rex_autotest_gpu_frame(uint64_t busy_ns, uint64_t span_ns);
 extern "C" void rex_autotest_gpu_passes(const uint64_t* ns, uint32_t count, uint64_t markers);
 // CPU time per frame for the cp_* zones (1 = cp_fence, 2 = cp_submit).
 extern "C" void rex_autotest_cpu_add(uint32_t zone, uint64_t ns);
+namespace {
+// cp_draw = 15, cp_pipe = 16, cp_bind = 17, cp_exec = 18 (core/autotest.cpp).
+inline std::chrono::steady_clock::time_point CpZoneNow() {
+  return std::chrono::steady_clock::now();
+}
+inline void CpZoneAdd(uint32_t zone, std::chrono::steady_clock::time_point start) {
+  rex_autotest_cpu_add(zone, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count()));
+}
+struct CpZoneScope {
+  uint32_t zone;
+  std::chrono::steady_clock::time_point start = CpZoneNow();
+  explicit CpZoneScope(uint32_t z) : zone(z) {}
+  ~CpZoneScope() { CpZoneAdd(zone, start); }
+};
+}  // namespace
+#define REX_CP_ZONE_SCOPE(z) CpZoneScope cp_zone_scope_##z(z)
+#define REX_CP_ZONE_START(var) const auto var = CpZoneNow()
+#define REX_CP_ZONE_ADD(z, var) CpZoneAdd(z, var)
 namespace {
 // The [gpu-pass] tick calibration (1.0 until it has one): timestamps are in GPU ticks, not ns.
 double g_autotest_ns_per_tick = 1.0;
@@ -2028,6 +2078,14 @@ void VulkanCommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first
 
 void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                      uint32_t title_id, bool blocking) {
+  // Translation-time experiment flags must be set before stored shaders are translated.
+  g_diag_ps_const_hash = REXCVAR_GET(diag_ps_const_hash);
+  g_spirv_ps_implicit_lod = REXCVAR_GET(spirv_ps_implicit_lod);
+  g_spirv_ps_ieee_mul = REXCVAR_GET(spirv_ps_ieee_mul);
+  g_spirv_ps_epx_hash = REXCVAR_GET(spirv_ps_epx_hash);
+  printf("[spvexp] implicit_lod=%d const_hash=%d ieee_mul=%d epx_hash=%d\n",
+         int(g_spirv_ps_implicit_lod), g_diag_ps_const_hash, int(g_spirv_ps_ieee_mul),
+         g_spirv_ps_epx_hash);
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
 }
@@ -5034,6 +5092,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+#ifdef __SWITCH__
+  REX_CP_ZONE_SCOPE(15);
+#endif
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
@@ -5205,6 +5266,49 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
   if (pixel_shader) ddiag.ps = pixel_shader->ucode_data_hash();
+  g_diag_ps_const_hash = REXCVAR_GET(diag_ps_const_hash);
+  g_spirv_ps_implicit_lod = REXCVAR_GET(spirv_ps_implicit_lod);
+  if (pixel_shader && ddiag.regs) {
+    // diag_draw_log: ucode disassembly of each pixel shader, once per hash.
+    static uint64_t seen[32];
+    static uint32_t seen_count = 0;
+    bool is_new = seen_count < 32;
+    for (uint32_t k = 0; is_new && k < seen_count; ++k) {
+      is_new = seen[k] != ddiag.ps;
+    }
+    if (is_new) {
+      seen[seen_count++] = ddiag.ps;
+      printf("[psd] begin ps%016llX\n", (unsigned long long)ddiag.ps);
+      const auto& text = pixel_shader->ucode_disassembly();
+      size_t pos = 0;
+      while (pos < text.size()) {
+        size_t eol = text.find('\n', pos);
+        if (eol == std::string::npos) eol = text.size();
+        printf("[psd] %.*s\n", int(eol - pos), text.data() + pos);
+        pos = eol + 1;
+      }
+      // Translated SPIR-V of every modification already created, as hex.
+      for (const auto& [mod, tr] : pixel_shader->translations()) {
+        if (!tr || !tr->is_valid()) continue;
+        const auto& bin = tr->translated_binary();
+        printf("[spv] ps%016llX mod%016llX bytes%zu\n", (unsigned long long)ddiag.ps,
+               (unsigned long long)mod, bin.size());
+        for (size_t o = 0; o < bin.size(); o += 256) {
+          char hex[513];
+          size_t n = std::min<size_t>(256, bin.size() - o);
+          for (size_t k = 0; k < n; ++k) {
+            snprintf(hex + 2 * k, 3, "%02X", uint8_t(bin[o + k]));
+          }
+          printf("[spx] %s\n", hex);
+        }
+      }
+      printf("[psd] end\n");
+    }
+  }
+  if (const int32_t tiny = REXCVAR_GET(diag_draw_tiny_scissor); tiny != 0) {
+    g_diag_tiny_scissor_draw =
+        tiny == 1 || (pixel_shader && int32_t(uint32_t(pixel_shader->ucode_data_hash())) == tiny);
+  }
   ddiag.stage = is_rasterization_done ? (pixel_shader ? "prim" : "prim_nops") : "prim_noraster";
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   if (memexport_used_pixel) {
@@ -5532,6 +5636,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!UpdateBindings(vertex_shader, pixel_shader)) {
     return draw_fail("update_bindings");
   }
+#ifdef __SWITCH__
+  REX_CP_ZONE_SCOPE(17);
+#endif
 
   // Ensure vertex buffers are resident.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
@@ -5732,6 +5839,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 #endif
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
+  }
+
+  // Diagnostic: cost of a render pass break / a barrier per draw (2026-11-07, handheld).
+  if (const int32_t draw_break = REXCVAR_GET(diag_draw_break); draw_break > 0) {
+    EndRenderPass();
+    for (int32_t i = 1; i < draw_break; ++i) {
+      deferred_command_buffer_.CmdVkPipelineBarrier(
+          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+          0, nullptr, 0, nullptr, 0, nullptr);
+    }
   }
 
   ddiag.stage = "ok";
@@ -7205,7 +7323,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       deferred_command_buffer_.SetPassTimer(&pass_timer);
     }
     shared_memory_->ExecuteHoistedUploads(command_buffer.buffer);
+#ifdef __SWITCH__
+    REX_CP_ZONE_START(cp_exec_start);
+#endif
     deferred_command_buffer_.Execute(command_buffer.buffer);
+#ifdef __SWITCH__
+    REX_CP_ZONE_ADD(18, cp_exec_start);
+#endif
     deferred_command_buffer_.SetPassTimer(nullptr);
     if (ts_slot != UINT32_MAX) {
       g_gpu_ts.pass_used[ts_slot] = uint16_t(pass_timer.used);
@@ -7244,6 +7368,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       return false;
     }
     VkResult submit_result;
+    // Host writes of the CPU texture loads (texture_cpu_copy_worker_core) must be done and
+    // flushed before the submission that reads them.
+    texture_cache_->FinishCpuCopies();
     {
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
@@ -7544,6 +7671,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   scissor_rect.offset.y = int32_t(scissor.offset[1]);
   scissor_rect.extent.width = scissor.extent[0];
   scissor_rect.extent.height = scissor.extent[1];
+  if (g_diag_tiny_scissor_draw) {
+    scissor_rect.extent.width = std::min(scissor_rect.extent.width, uint32_t(1));
+    scissor_rect.extent.height = std::min(scissor_rect.extent.height, uint32_t(1));
+  }
   SetScissor(scissor_rect);
 
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {

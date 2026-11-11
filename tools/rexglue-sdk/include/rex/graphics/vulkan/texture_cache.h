@@ -28,6 +28,11 @@ class VulkanCommandProcessor;
 
 class VulkanTextureCache final : public TextureCache {
  public:
+  // texture_cpu_copy_worker_core: waits for the queued CPU texture copies and flushes them. Must
+  // be called before submitting commands that may read those images, and before destroying one.
+  void FinishCpuCopies() const;
+  void StopCpuCopyWorker();
+
   // Sampler parameters that can be directly converted to a host sampler or used
   // for checking whether samplers bindings are up to date.
   union SamplerParameters {

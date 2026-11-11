@@ -48,11 +48,15 @@ std::atomic<bool> g_gpu_passes_seen{false};
 // part spent in Sleep), n_wrm = how many of those waits.
 // n_draw/n_rp/n_bar/n_copy/n_disp = commands replayed by DeferredCommandBuffer::Execute
 // (draws, render pass/rendering begins, pipeline barriers, copies+blits, dispatches).
-constexpr uint32_t kCpuZones = 15;
+// cp_draw = whole VulkanCommandProcessor::IssueDraw (includes cp_pre, cp_tex, cp_post);
+// cp_copy = row copies + flush of the CPU texture loads (part of cp_tex); cp_post = after
+// UpdateBindings to the end (vertex/shared memory ranges, barriers, render pass, draw); cp_exec = DeferredCommandBuffer::Execute (Vulkan command recording).
+constexpr uint32_t kCpuZones = 19;
 const char* const kCpuZoneNames[kCpuZones] = {"cp_idle", "cp_fence", "cp_submit", "cp_tex",
                                               "n_tex",   "n_batch",  "n_skip",    "cp_wrm",
                                               "cp_wrm_slp", "n_wrm", "n_draw", "n_rp",
-                                              "n_bar",   "n_copy",   "n_disp"};
+                                              "n_bar",   "n_copy",   "n_disp",    "cp_draw",
+                                              "cp_copy", "cp_post",  "cp_exec"};
 std::atomic<uint64_t> g_cpu_zone_ns[kCpuZones];
 }  // namespace
 

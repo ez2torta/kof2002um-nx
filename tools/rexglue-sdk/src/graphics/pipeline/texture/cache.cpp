@@ -109,6 +109,16 @@ bool TakePollPagesDirty(uint32_t first, uint32_t size, uint32_t& lo, uint32_t& h
 }
 }  // namespace
 
+// Guest physical address of a guest virtual one in the physical views (0xA0000000+), UINT32_MAX if
+// unknown (texture_cpu_copy_worker_core barrier in vulkan/texture_cache.cpp).
+extern "C" uint32_t rex_texture_guest_physical(uint32_t guest_address) {
+  if (!g_poll_memory || guest_address < 0xA0000000u) {
+    return UINT32_MAX;
+  }
+  const uint32_t physical = g_poll_memory->GetPhysicalAddress(guest_address);
+  return physical >= 0x20000000u ? UINT32_MAX : physical;
+}
+
 // Whether [guest_address, guest_address + size) touches a polled texture's pages (the game's hook
 // then compares the data first and reports only real changes).
 extern "C" int rex_texture_poll_watched(uint32_t guest_address, uint32_t size) {
