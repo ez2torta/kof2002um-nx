@@ -33,8 +33,12 @@ step_fetch() {
   # El fork de ez2torta cambió FFmpeg para Switch (config_*.h, tablas FFT/MDCT), pero esos cambios no están en el repo.
   # Aproximación: usar la config de linux-aarch64 para __SWITCH__ (newlib/libnx tiene pthreads y libm C99).
   local C=$T/FFmpeg/config.h
+  if [ -f "$C" ]; then
+    # config_switch_aarch64.h = linux-aarch64 sin lo que Horizon/newlib no tiene (mmap, sysctl, getauxval, ...)
+    sed -E 's/^(#define (HAVE_MMAP|HAVE_MPROTECT|HAVE_SYS_MMAN_H|HAVE_SYSCTL|HAVE_GETAUXVAL|HAVE_SYS_AUXV_H|HAVE_SCHED_GETAFFINITY|HAVE_SYS_RESOURCE_H|HAVE_GETRUSAGE|HAVE_ISATTY|HAVE_GETADDRINFO|HAVE_SYS_SELECT_H|HAVE_POLL_H|HAVE_PTHREAD_CANCEL|HAVE_SETRLIMIT|HAVE_ARC4RANDOM|HAVE_SYSCONF|HAVE_POSIX_MEMALIGN)) 1/\1 0/; s/^(#define HAVE_MALLOC_H) 0/\1 1/' "$T/FFmpeg/config_linux_aarch64.h" > "$T/FFmpeg/config_switch_aarch64.h"
+  fi
   if [ -f "$C" ] && ! grep -q __SWITCH__ "$C"; then
-    sed -i 's|^#elif defined(__ANDROID__)|#elif defined(__SWITCH__)\n#include "config_linux_aarch64.h"\n#elif defined(__ANDROID__)|' "$C"
+    sed -i 's|^#elif defined(__ANDROID__)|#elif defined(__SWITCH__)\n#include "config_switch_aarch64.h"\n#elif defined(__ANDROID__)|' "$C"
     echo ">> FFmpeg/config.h: rama __SWITCH__ -> config_linux_aarch64.h"
   fi
 }
@@ -92,7 +96,7 @@ step_configure() {
 }
 
 step_build() {
-  cmake --build "$SWBUILD" -j"$JOBS"
+  cmake --build "$SWBUILD" -j"$JOBS" -- -k 0
   ls -la "$REPO"/kof2002um*.nro 2>/dev/null || echo "(no apareció el .nro en $REPO)"
 }
 

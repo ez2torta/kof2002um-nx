@@ -77,7 +77,7 @@ endif()
 file(READ "${_SWITCH_SPECS_SOURCE}" _SWITCH_SPECS_CONTENT)
 string(REPLACE
     "%:getenv(DEVKITPRO /libnx/switch.ld)"
-    "D:/devkitPro/libnx/switch.ld"
+    "${DEVKITPRO}/libnx/switch.ld"
     _SWITCH_SPECS_CONTENT
     "${_SWITCH_SPECS_CONTENT}")
 set(_SWITCH_SPECS_CONFIGURED "${CMAKE_BINARY_DIR}/switch.specs")
