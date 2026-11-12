@@ -639,6 +639,12 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
       std::fprintf(f, "     texture loads per frame %s\n", tex_stats);
     }
     if (presents > 0.0) {
+      std::fprintf(f, "     chain fuse: %.2f filter rounds fused per frame, %.2f cancelled, %.2f resolves skipped\n",
+                   double(counters_now[44] - counters_last[44]) / presents,
+                   double(counters_now[45] - counters_last[45]) / presents,
+                   double(counters_now[46] - counters_last[46]) / presents);
+    }
+    if (presents > 0.0) {
       std::fprintf(f, "     resolves copied straight into a texture: %.1f per frame (%.1f of them with the red/blue swap blit)\n",
                    double(counters_now[43] - counters_last[43]) / presents,
                    double(counters_now[42] - counters_last[42]) / presents);

@@ -244,6 +244,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Returns the text to display in the GPU backend name in the window title.
   std::string GetWindowTitleText() const;
 
+  // chain_fuse (kof2002um): called by the render target cache for every resolve before it is done;
+  // true = skip it (the filter round was fused, see command_processor.cpp). copy_only = the resolve
+  // neither clears color nor depth.
+  bool ChainFuseOnResolve(uint32_t dest_page, bool copy_only);
+
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
@@ -262,6 +267,19 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
+
+  // chain_fuse state machine: 0 = draw normally, 1 = filter draw to be blended over the target,
+  // 2 = skip this draw.
+  int ChainFuseOnDraw(uint64_t ps_hash, uint32_t blend0, uint32_t t0_page);
+  struct ChainFuseState {
+    enum State : uint32_t { kIdle, kExpectResolveB, kExpectCopyOpaque, kExpectCopyAlpha };
+    State state = kIdle;
+    uint32_t pages[2] = {0, 0};  // destination pages of the last two resolves, the latest in [1]
+    uint32_t resolves_seen = 0;
+    uint32_t draws_since_resolve = 0;
+    uint32_t page_a = 0, page_b = 0;
+  };
+  ChainFuseState chain_fuse_;
 
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;

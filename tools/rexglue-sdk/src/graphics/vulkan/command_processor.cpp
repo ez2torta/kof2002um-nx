@@ -76,6 +76,12 @@ REXCVAR_DEFINE_STRING(diag_skip_ps, "", "GPU",
                       "Diagnostic: comma-separated hex pixel shader ucode hashes (16 digits) whose draw command is not "
                       "recorded (state, render pass and barriers still are). To measure what a family of draws costs "
                       "and how the picture looks without it");
+REXCVAR_DEFINE_BOOL(chain_fuse, false, "GPU/Vulkan",
+                    "kof2002um: fuse each filter round of the composition chain. The game does RESOLVE A; RESOLVE B; "
+                    "filter(B) -> target (opaque); RESOLVE B; copy(A) -> target (opaque); copy(B) -> target (alpha "
+                    "blend). Drawing the filter with that alpha blend straight over the target, which still holds A, "
+                    "gives the same picture, so the last resolve and the two copy draws are skipped. Any deviation "
+                    "from that sequence cancels the fusion for the round");
 REXCVAR_DEFINE_BOOL(diag_draw_pass_split, false, "GPU",
                     "Diagnostic (kof2002um): label each draw family with its own GPU pass category so the per-frame "
                     "GPU report splits them: ps36D6 sprites -> dump, ps6082 atlas sprites -> readback, ps03B1/ps7238 "
@@ -5222,6 +5228,88 @@ static bool ComputeIndexedLayerBBox(const RegisterFile& regs, MemoryT* mem, uint
   return true;
 }
 
+// ---- chain_fuse -----------------------------------------------------------------------------
+bool VulkanCommandProcessor::ChainFuseOnResolve(uint32_t dest_page, bool copy_only) {
+  if (!REXCVAR_GET(chain_fuse)) {
+    return false;
+  }
+  ChainFuseState& f = chain_fuse_;
+  switch (f.state) {
+    case ChainFuseState::kExpectResolveB:
+      if (copy_only && dest_page == f.page_b) {
+        f.state = ChainFuseState::kExpectCopyOpaque;
+#if REX_PLATFORM_SWITCH
+        RexSwitchPerfCount(46);  // resolve skipped by the fusion
+#endif
+        return true;
+      }
+      f.state = ChainFuseState::kIdle;
+#if REX_PLATFORM_SWITCH
+      RexSwitchPerfCount(45);  // fusion cancelled
+#endif
+      break;
+    case ChainFuseState::kExpectCopyOpaque:
+    case ChainFuseState::kExpectCopyAlpha:
+      f.state = ChainFuseState::kIdle;
+#if REX_PLATFORM_SWITCH
+      RexSwitchPerfCount(45);
+#endif
+      break;
+    default:
+      break;
+  }
+  f.pages[0] = f.pages[1];
+  f.pages[1] = dest_page;
+  f.resolves_seen = std::min<uint32_t>(f.resolves_seen + 1, 2);
+  f.draws_since_resolve = 0;
+  return false;
+}
+
+int VulkanCommandProcessor::ChainFuseOnDraw(uint64_t ps_hash, uint32_t blend0, uint32_t t0_page) {
+  constexpr uint64_t kFilterPs = 0xD1048F8A2AB44432ull;  // 3x3 neighbour-equality pixel filter
+  constexpr uint64_t kCopyPs = 0x7ABDFEFBCADB4BF9ull;    // textured copy tinted by the vertex color
+  constexpr uint32_t kBlendOpaque = 0x00010001;
+  constexpr uint32_t kBlendOver = 0x01610701;
+  ChainFuseState& f = chain_fuse_;
+  switch (f.state) {
+    case ChainFuseState::kIdle:
+      // RESOLVE A; RESOLVE B; filter(B): nothing drawn since the last resolve, so the target still holds A.
+      if (ps_hash == kFilterPs && blend0 == kBlendOpaque && f.resolves_seen >= 2 &&
+          f.draws_since_resolve == 0 && f.pages[0] != f.pages[1] && t0_page == f.pages[1]) {
+        f.page_a = f.pages[0];
+        f.page_b = f.pages[1];
+        f.state = ChainFuseState::kExpectResolveB;
+        return 1;
+      }
+      ++f.draws_since_resolve;
+      return 0;
+    case ChainFuseState::kExpectCopyOpaque:
+      if (ps_hash == kCopyPs && blend0 == kBlendOpaque && t0_page == f.page_a) {
+        f.state = ChainFuseState::kExpectCopyAlpha;
+        return 2;
+      }
+      break;
+    case ChainFuseState::kExpectCopyAlpha:
+      if (ps_hash == kCopyPs && blend0 == kBlendOver && t0_page == f.page_b) {
+        f.state = ChainFuseState::kIdle;
+        f.draws_since_resolve = 0;
+#if REX_PLATFORM_SWITCH
+        RexSwitchPerfCount(44);  // a filter round fused completely
+#endif
+        return 2;
+      }
+      break;
+    default:  // kExpectResolveB: a draw came instead of the resolve
+      break;
+  }
+  f.state = ChainFuseState::kIdle;
+  ++f.draws_since_resolve;
+#if REX_PLATFORM_SWITCH
+  RexSwitchPerfCount(45);
+#endif
+  return 0;
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -5399,6 +5487,30 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
   if (pixel_shader) ddiag.ps = pixel_shader->ucode_data_hash();
+  // chain_fuse: the blend of the filter draw is overridden for this draw only; restored on any return.
+  struct ChainBlendRestore {
+    uint32_t* reg = nullptr;
+    uint32_t saved = 0;
+    ~ChainBlendRestore() {
+      if (reg) {
+        *reg = saved;
+      }
+    }
+  } chain_blend_restore;
+  if (pixel_shader && REXCVAR_GET(chain_fuse)) {
+    const uint32_t blend_reg = reg::RB_BLENDCONTROL::rt_register_indices[0];
+    const int fuse_action = ChainFuseOnDraw(pixel_shader->ucode_data_hash(), regs[blend_reg],
+                                            uint32_t(regs.GetTextureFetch(0).base_address));
+    if (fuse_action == 2) {
+      ddiag.stage = "fused_skip";
+      return true;
+    }
+    if (fuse_action == 1) {
+      chain_blend_restore.reg = &register_file_->values[blend_reg];
+      chain_blend_restore.saved = *chain_blend_restore.reg;
+      *chain_blend_restore.reg = 0x01610701;
+    }
+  }
   ddiag.stage = is_rasterization_done ? (pixel_shader ? "prim" : "prim_nops") : "prim_noraster";
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   if (memexport_used_pixel) {

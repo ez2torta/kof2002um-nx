@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -171,6 +173,12 @@ extern "C" void rex_tex_take_path_stats(char* out, uint32_t cap, double frames) 
   std::memset(g_texpath_total, 0, sizeof(g_texpath_total));
 }
 #endif
+
+REXCVAR_DEFINE_STRING(resolve_texture_store_pages, "", "GPU/Vulkan",
+                      "kof2002um: comma separated hex texture pages (guest address >> 12, e.g. 186D2,1F52B) that only "
+                      "the GPU writes through resolves. Their resolve copies go into images owned by a store (no "
+                      "red/blue swap blit, the view swaps the channels) and draws sample those. Empty = off. Do not "
+                      "list a page that is also sampled as the swap (present) texture");
 
 namespace rex::graphics::vulkan {
 
@@ -593,6 +601,7 @@ VulkanTextureCache::~VulkanTextureCache() {
     dfn.vkFreeMemory(device, load_ring_memory_, nullptr);
     load_ring_memory_ = VK_NULL_HANDLE;
   }
+  ResolveStoreDestroy();
   if (rtt_swap_image_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImage(device, rtt_swap_image_, nullptr);
     rtt_swap_image_ = VK_NULL_HANDLE;
@@ -759,7 +768,10 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
       continue;
     }
     VulkanTexture* binding_texture = static_cast<VulkanTexture*>(binding->texture);
-    if (binding_texture != nullptr) {
+    if (binding_texture != nullptr && ResolveStoreCovers(binding->key)) {
+      // The store image is sampled instead; the texture's own image is not touched.
+      binding_texture->MarkAsUsed();
+    } else if (binding_texture != nullptr) {
       // Will be referenced by the command buffer, so mark as used.
       binding_texture->MarkAsUsed();
       VulkanTexture::Usage old_usage =
@@ -830,6 +842,12 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
           texture->cpu_last_use_submission = command_processor_.GetCurrentSubmission();
         }
       }
+    }
+  }
+  if (!is_signed && binding && !resolve_store_.empty()) {
+    const VkImageView store_view = ResolveStoreView(binding->key, binding->host_swizzle);
+    if (store_view != VK_NULL_HANDLE) {
+      return store_view;
     }
   }
   if (image_view != VK_NULL_HANDLE) {
@@ -1863,6 +1881,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                                bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
+  if (load_base) {
+    ResolveStoreDropMatching(texture_key);
+  }
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(14);
   rex_autotest_cpu_add(4, 1000000);  // n_tex
@@ -2758,6 +2779,7 @@ uint32_t VulkanTextureCache::ResolveCopyToTextures(VkImage src_image, int32_t sr
   // With a red/blue swap, the render target is blitted once into the B8G8R8A8 scratch (on the
   // first matching texture), and the textures are then copied from there.
   bool swap_blit_done = false;
+  bool store_copied_this_call = false;
   auto prepare_swap_source = [&]() -> bool {
     if (swap_blit_done) {
       return true;
@@ -2866,6 +2888,49 @@ uint32_t VulkanTextureCache::ResolveCopyToTextures(VkImage src_image, int32_t sr
     VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
     // A load into it may still be waiting in the batch: record it first, so this copy lands last.
     FlushTextureLoadBatch();
+    if (ResolveStoreAllowsPage(uint32_t(key.base_page)) && covers_all) {
+      ResolveStoreEntry* entry = ResolveStoreGetOrCreate(uint32_t(key.base_page), tex_width, tex_height);
+      if (entry) {
+        if (!store_copied_this_call) {
+          store_copied_this_call = true;
+          const bool first = !entry->in_sampled_layout;
+          command_processor_.PushImageMemoryBarrier(
+              entry->image, ui::vulkan::util::InitializeSubresourceRange(),
+              first ? VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
+                    : VkPipelineStageFlags(guest_shader_pipeline_stages_ |
+                                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT),
+              VK_PIPELINE_STAGE_TRANSFER_BIT, first ? VkAccessFlags(0) : VkAccessFlags(VK_ACCESS_SHADER_READ_BIT),
+              VK_ACCESS_TRANSFER_WRITE_BIT,
+              first ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+          command_processor_.SubmitBarriers(true);
+          VkImageCopy store_region = {};
+          store_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+          store_region.srcSubresource.layerCount = 1;
+          store_region.srcOffset = {src_x, src_y, 0};
+          store_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+          store_region.dstSubresource.layerCount = 1;
+          store_region.dstOffset = {0, 0, 0};
+          store_region.extent = {copy_width, copy_height, 1};
+          DeferredCommandBuffer& store_cb = command_processor_.deferred_command_buffer();
+          store_cb.MarkPass(DeferredCommandBuffer::PassCategory::kResolve);
+          store_cb.CmdVkCopyImage(src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, entry->image,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, store_region);
+          command_processor_.PushImageMemoryBarrier(
+              entry->image, ui::vulkan::util::InitializeSubresourceRange(),
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+              guest_shader_pipeline_stages_ | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+              VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+          entry->in_sampled_layout = true;
+          entry->rb_swapped = swap_red_blue;
+          entry->valid = true;
+        }
+        // The texture is marked up to date, its own image stays stale: the store view replaces it.
+        resolve_copied_textures_.push_back(&vulkan_texture);
+        return;
+      }
+    }
     if (swap_red_blue && !prepare_swap_source()) {
       log_skip(key, "swap scratch");
       return;
@@ -2927,6 +2992,195 @@ void VulkanTextureCache::FinishResolveCopyToTextures() {
     texture->MakeUpToDateAndWatch(global_lock);
   }
   resolve_copied_textures_.clear();
+}
+
+// ---- resolve_texture_store -------------------------------------------------------------------
+static uint32_t SwapRedBlueInHostSwizzle(uint32_t swizzle) {
+  uint32_t out = 0;
+  for (uint32_t c = 0; c < 4; ++c) {
+    uint32_t source = (swizzle >> (3 * c)) & 0b111;
+    if (source == 0) {
+      source = 2;
+    } else if (source == 2) {
+      source = 0;
+    }
+    out |= source << (3 * c);
+  }
+  return out;
+}
+
+static VkComponentSwizzle StoreComponentSwizzle(uint32_t swizzle, uint32_t component) {
+  switch ((swizzle >> (3 * component)) & 0b111) {
+    case 0:
+      return VK_COMPONENT_SWIZZLE_R;
+    case 1:
+      return VK_COMPONENT_SWIZZLE_G;
+    case 2:
+      return VK_COMPONENT_SWIZZLE_B;
+    case 3:
+      return VK_COMPONENT_SWIZZLE_A;
+    case 4:
+      return VK_COMPONENT_SWIZZLE_ZERO;
+    default:
+      return VK_COMPONENT_SWIZZLE_ONE;
+  }
+}
+
+bool VulkanTextureCache::ResolveStoreAllowsPage(uint32_t base_page) {
+  if (!resolve_store_parsed_) {
+    resolve_store_parsed_ = true;
+    const std::string text = REXCVAR_GET(resolve_texture_store_pages);
+    size_t pos = 0;
+    while (pos < text.size()) {
+      size_t end = text.find_first_of(", ", pos);
+      if (end == std::string::npos) {
+        end = text.size();
+      }
+      if (end > pos) {
+        resolve_store_pages_.push_back(uint32_t(std::strtoul(text.substr(pos, end - pos).c_str(), nullptr, 16)));
+      }
+      pos = end + 1;
+    }
+    // The views swap red and blue with the component mapping: the device must support it.
+    if (!command_processor_.GetVulkanDevice()->properties().imageViewFormatSwizzle) {
+      resolve_store_pages_.clear();
+    }
+  }
+  for (uint32_t page : resolve_store_pages_) {
+    if (page == base_page) {
+      return true;
+    }
+  }
+  return false;
+}
+
+VulkanTextureCache::ResolveStoreEntry* VulkanTextureCache::ResolveStoreFind(uint32_t base_page) {
+  for (ResolveStoreEntry& entry : resolve_store_) {
+    if (entry.base_page == base_page) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+VulkanTextureCache::ResolveStoreEntry* VulkanTextureCache::ResolveStoreGetOrCreate(
+    uint32_t base_page, uint32_t width, uint32_t height) {
+  ResolveStoreEntry* entry = ResolveStoreFind(base_page);
+  if (entry && entry->width == width && entry->height == height) {
+    return entry;
+  }
+  if (entry) {
+    // Same page, other size: not what this store was made for.
+    return nullptr;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  VkImageCreateInfo image_create_info = {};
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  image_create_info.extent = {width, height, 1};
+  image_create_info.mipLevels = 1;
+  image_create_info.arrayLayers = 1;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImage image = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+          vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image,
+          memory)) {
+    REXGPU_ERROR("resolve_texture_store: could not create the {}x{} image for page {:05X}", width,
+                 height, base_page);
+    return nullptr;
+  }
+  resolve_store_.emplace_back();
+  entry = &resolve_store_.back();
+  entry->base_page = base_page;
+  entry->width = width;
+  entry->height = height;
+  entry->image = image;
+  entry->memory = memory;
+  REXGPU_INFO("[store] resolve texture store: page {:05X} {}x{} created", base_page, width, height);
+  return entry;
+}
+
+bool VulkanTextureCache::ResolveStoreCovers(const TextureKey& key) {
+  if (resolve_store_.empty()) {
+    return false;
+  }
+  ResolveStoreEntry* entry = ResolveStoreFind(uint32_t(key.base_page));
+  return entry && entry->valid && entry->width == key.GetWidth() && entry->height == key.GetHeight() &&
+         key.format == xenos::TextureFormat::k_8_8_8_8 &&
+         key.dimension == xenos::DataDimension::k2DOrStacked && !key.mip_max_level &&
+         !key.signed_separate;
+}
+
+VkImageView VulkanTextureCache::ResolveStoreView(const TextureKey& key, uint32_t host_swizzle) {
+  if (!ResolveStoreCovers(key)) {
+    return VK_NULL_HANDLE;
+  }
+  ResolveStoreEntry* entry = ResolveStoreFind(uint32_t(key.base_page));
+  const uint32_t effective = entry->rb_swapped ? SwapRedBlueInHostSwizzle(host_swizzle) : host_swizzle;
+  auto it = entry->views.find(effective);
+  if (it != entry->views.end()) {
+    return it->second;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkImageViewCreateInfo view_create_info = {};
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.image = entry->image;
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;  // as VulkanTexture::GetView(..., is_array = true)
+  view_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  view_create_info.components.r = StoreComponentSwizzle(effective, 0);
+  view_create_info.components.g = StoreComponentSwizzle(effective, 1);
+  view_create_info.components.b = StoreComponentSwizzle(effective, 2);
+  view_create_info.components.a = StoreComponentSwizzle(effective, 3);
+  view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
+  VkImageView view = VK_NULL_HANDLE;
+  if (dfn.vkCreateImageView(vulkan_device->device(), &view_create_info, nullptr, &view) != VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  entry->views.emplace(effective, view);
+  return view;
+}
+
+void VulkanTextureCache::ResolveStoreDropMatching(const TextureKey& key) {
+  if (resolve_store_.empty()) {
+    return;
+  }
+  ResolveStoreEntry* entry = ResolveStoreFind(uint32_t(key.base_page));
+  if (entry && entry->valid && entry->width == key.GetWidth() && entry->height == key.GetHeight()) {
+    // A load is about to write the texture's own image with the memory contents: the store is stale.
+    entry->valid = false;
+    static uint32_t dropped_logged = 0;
+    if (dropped_logged++ < 16) {
+      REXGPU_INFO("[store] page {:05X} dropped by a texture load", uint32_t(key.base_page));
+    }
+  }
+}
+
+void VulkanTextureCache::ResolveStoreDestroy() {
+  if (resolve_store_.empty()) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (ResolveStoreEntry& entry : resolve_store_) {
+    for (auto& view : entry.views) {
+      dfn.vkDestroyImageView(device, view.second, nullptr);
+    }
+    if (entry.image != VK_NULL_HANDLE) {
+      dfn.vkDestroyImage(device, entry.image, nullptr);
+    }
+    if (entry.memory != VK_NULL_HANDLE) {
+      dfn.vkFreeMemory(device, entry.memory, nullptr);
+    }
+  }
+  resolve_store_.clear();
 }
 
 void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {

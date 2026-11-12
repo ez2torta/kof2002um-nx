@@ -1832,6 +1832,15 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     return true;
   }
 #if REX_PLATFORM_SWITCH
+  // chain_fuse: a resolve of the fused filter round is not done at all (copy only, no clears).
+  if (command_processor_.ChainFuseOnResolve(
+          uint32_t(resolve_info.copy_dest_base >> 12),
+          resolve_info.copy_dest_extent_length && !resolve_info.IsClearingColor() &&
+              !resolve_info.IsClearingDepth() && !resolve_info.IsCopyingDepth())) {
+    return true;
+  }
+#endif
+#if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(9);
   RexSwitchPerfAdd(10, uint64_t(resolve_info.coordinate_info.width_div_8) * 8 *
                            uint64_t(resolve_info.height_div_8) * 8);

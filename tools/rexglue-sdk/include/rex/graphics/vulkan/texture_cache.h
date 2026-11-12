@@ -143,6 +143,13 @@ class VulkanTextureCache final : public TextureCache {
                                  bool swap_red_blue = false);
   void FinishResolveCopyToTextures();
 
+  // resolve_texture_store_pages (kof2002um): for the listed texture pages (hex, comma separated) that
+  // only the GPU writes, ResolveCopyToTextures copies the render target into an image the store owns
+  // (no red/blue swap blit: the view swaps the channels) and bindings sample that image. Returns
+  // VK_NULL_HANDLE when the store does not cover the texture.
+  VkImageView ResolveStoreView(const TextureKey& key, uint32_t host_swizzle);
+  bool ResolveStoreCovers(const TextureKey& key);
+
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
@@ -499,6 +506,26 @@ class VulkanTextureCache final : public TextureCache {
   VkDeviceMemory rtt_swap_memory_ = VK_NULL_HANDLE;
   bool rtt_swap_image_used_ = false;
   bool rtt_swap_creation_failed_ = false;
+
+  // resolve_texture_store: see ResolveStoreView.
+  struct ResolveStoreEntry {
+    uint32_t base_page = 0;
+    uint32_t width = 0, height = 0;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    bool in_sampled_layout = false;
+    bool rb_swapped = false;  // the image holds the render target channel order, the view swaps R/B
+    bool valid = false;       // holds a complete resolve of the texture
+    std::unordered_map<uint32_t, VkImageView> views;  // by the effective host swizzle
+  };
+  std::vector<ResolveStoreEntry> resolve_store_;
+  std::vector<uint32_t> resolve_store_pages_;
+  bool resolve_store_parsed_ = false;
+  bool ResolveStoreAllowsPage(uint32_t base_page);
+  ResolveStoreEntry* ResolveStoreFind(uint32_t base_page);
+  ResolveStoreEntry* ResolveStoreGetOrCreate(uint32_t base_page, uint32_t width, uint32_t height);
+  void ResolveStoreDropMatching(const TextureKey& key);
+  void ResolveStoreDestroy();
   bool load_batch_linear_war_done_ = false;
   VkBuffer load_ring_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory load_ring_memory_ = VK_NULL_HANDLE;
