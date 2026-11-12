@@ -490,9 +490,15 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
     // Alpha test.
     // TODO(Triang3l): Check how alpha test works with NaN on Direct3D 9.
     // Extract the comparison function (less, equal, greater bits).
-    spv::Id alpha_test_function = builder_->createTriOp(
-        spv::OpBitFieldUExtract, type_uint_, main_system_constant_flags_,
-        builder_->makeUintConstant(kSysFlag_AlphaPassIfLess_Shift), builder_->makeUintConstant(3));
+    const Modification::PixelShaderModification static_pixel =
+        GetSpirvShaderModification().pixel;
+    spv::Id alpha_test_function =
+        static_pixel.static_state
+            ? builder_->makeUintConstant(static_pixel.static_alpha_test_function)
+            : builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
+                                    main_system_constant_flags_,
+                                    builder_->makeUintConstant(kSysFlag_AlphaPassIfLess_Shift),
+                                    builder_->makeUintConstant(3));
     // Check if the comparison function is not "always" - that should pass even
     // for NaN likely, unlike "less, equal or greater".
     SpirvBuilder::IfBuilder if_alpha_test_function_is_non_always(
@@ -1330,6 +1336,10 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         // Keep parity with D3D12: use explicit Xenos PWL gamma conversion in
         // shader code for gamma render targets in this path, rather than host
         // sRGB attachment conversion behavior.
+        const Modification::PixelShaderModification static_pixel_rt =
+            GetSpirvShaderModification().pixel;
+        if (!(static_pixel_rt.static_state && static_pixel_rt.static_color0_no_gamma &&
+              color_target_index == 0)) {
         uint_vector_temp_.clear();
         uint_vector_temp_.push_back(0);
         uint_vector_temp_.push_back(1);
@@ -1358,6 +1368,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
           color_rgba_shuffle_op->addImmediateOperand(3 + 3);
           color = color_rgba_shuffle_op->getResultId();
           builder_->getBuildPoint()->addInstruction(std::move(color_rgba_shuffle_op));
+        }
         }
 
         builder_->createStore(color, color_variable);

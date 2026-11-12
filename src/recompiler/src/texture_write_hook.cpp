@@ -16,6 +16,8 @@
 extern "C" void __imp__sub_82726240(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" int rex_texture_poll_watched(uint32_t guest_address, uint32_t size);
 extern "C" void rex_texture_note_cpu_write(uint32_t guest_address, uint32_t size);
+// texture_cpu_copy_worker_core: waits until the worker finished copying out of guest memory.
+extern "C" void rex_texture_cpu_copy_barrier(uint32_t guest_address, uint32_t size);
 
 extern "C" void sub_82726240(PPCContext& __restrict ctx, uint8_t* base) {
   const uint32_t dst = ctx.r3.u32;
@@ -26,6 +28,9 @@ extern "C" void sub_82726240(PPCContext& __restrict ctx, uint8_t* base) {
     return;
   }
   const bool same = std::memcmp(base + dst, base + src, size) == 0;
+  if (!same) {
+    rex_texture_cpu_copy_barrier(dst, size);
+  }
   __imp__sub_82726240(ctx, base);
   if (!same) {
     rex_texture_note_cpu_write(dst, size);

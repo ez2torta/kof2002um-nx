@@ -52,6 +52,9 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
   size_t stream_remaining = command_stream_.size();
 #ifdef __SWITCH__
   uint64_t n_draw = 0, n_rp = 0, n_bar = 0, n_copy = 0, n_disp = 0;
+  // n_cmd = every command; n_bind = BindPipeline + BindDescriptorSets + BindVertex/IndexBuffer;
+  // n_dyn = SetViewport/Scissor/Blend/Depth bias/Stencil + PushConstants (2026-11-11).
+  uint64_t n_cmd = 0, n_bind = 0, n_dyn = 0;
   // --at-cmd-trace=<frame>: the command sequence of each submission in that frame, one [AT] log line
   // per submission (d draw, [ ] rendering begin/end, b barrier, u buf->img, c buf, i img, l blit,
   // x dispatch, k clear image, a clear attachments, 0-9 pass marker category).
@@ -70,6 +73,22 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 #ifdef __SWITCH__
     {
       char c = 0;
+      ++n_cmd;
+      switch (header.command) {
+        case Command::kVkBindPipeline:
+        case Command::kVkBindDescriptorSets:
+        case Command::kVkBindVertexBuffers:
+        case Command::kVkBindIndexBuffer: ++n_bind; break;
+        case Command::kVkSetViewport:
+        case Command::kVkSetScissor:
+        case Command::kVkSetBlendConstants:
+        case Command::kVkSetDepthBias:
+        case Command::kVkSetStencilCompareMask:
+        case Command::kVkSetStencilReference:
+        case Command::kVkSetStencilWriteMask:
+        case Command::kVkPushConstants: ++n_dyn; break;
+        default: break;
+      }
       switch (header.command) {
         case Command::kVkDraw:
         case Command::kVkDrawIndexed: ++n_draw; c = 'd'; break;
@@ -407,6 +426,9 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
   rex_autotest_cpu_add(12, n_bar * 1000000ull);
   rex_autotest_cpu_add(13, n_copy * 1000000ull);
   rex_autotest_cpu_add(14, n_disp * 1000000ull);
+  rex_autotest_cpu_add(22, n_cmd * 1000000ull);
+  rex_autotest_cpu_add(23, n_bind * 1000000ull);
+  rex_autotest_cpu_add(24, n_dyn * 1000000ull);
 #endif
 }
 

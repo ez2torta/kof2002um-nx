@@ -95,7 +95,7 @@ tree(ROOT / "tools" / "switch", "tools/switch")
 # 4. Documentación, estado y configuración de la Switch.
 tree(ROOT / "docs", "docs")
 put(ROOT / "PORT_STATUS.md", "PORT_STATUS.md")
-put(ROOT / "switch" / "kof2002um-nx-60fps" / "kof2002um_nx.toml", "switch/kof2002um_nx.toml")
+put(ROOT / "switch" / "kof2002um-nx-20261111b" / "kof2002um_nx.toml", "switch/kof2002um_nx.toml")
 
 # 5. Configs del bench automático (devkitnx).
 tree(PORTS / "devkitnx" / "configs", "bench/devkitnx-configs", ("_nl_*.json",))

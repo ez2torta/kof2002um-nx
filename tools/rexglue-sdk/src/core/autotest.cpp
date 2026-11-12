@@ -49,11 +49,25 @@ std::atomic<bool> g_gpu_passes_seen{false};
 // part spent in Sleep), n_wrm = how many of those waits.
 // n_draw/n_rp/n_bar/n_copy/n_disp = commands replayed by DeferredCommandBuffer::Execute
 // (draws, render pass/rendering begins, pipeline barriers, copies+blits, dispatches).
-constexpr uint32_t kCpuZones = 15;
+// cp_draw = whole VulkanCommandProcessor::IssueDraw (includes cp_pre, cp_tex, cp_post);
+// cp_copy = row copies + flush of the CPU texture loads (part of cp_tex); cp_post = after
+// UpdateBindings to the end (vertex/shared memory ranges, barriers, render pass, draw); cp_exec = DeferredCommandBuffer::Execute (Vulkan command recording).
+// Parts of cp_post (2026-11-11): cp_vbuf = vertex buffer + memexport RequestRange, cp_smem =
+// guest DMA index snapshot + shared_memory Use, cp_rpass = SubmitBarriersAndEnterRenderTarget
+// CacheRenderPass; the rest of cp_post is the draw recording. n_cmd/n_bind/n_dyn = all commands,
+// binds and dynamic state replayed by Execute. AT__MAX_ZONES is 48 in include/rex/autotest.h.
+// Inside VulkanSharedMemory::TryCpuUpload: cp_vcmp = memcmp against in-flight ranges, cp_vval =
+// MakeRangeValid (re-arms the access watches), cp_vcpy = memcpy + flush, n_vpg = pages uploaded,
+// n_vfb = fallbacks to GPU copies; n_vreq = vertex buffer RequestRange calls.
+constexpr uint32_t kCpuZones = 31;
 const char* const kCpuZoneNames[kCpuZones] = {"cp_idle", "cp_fence", "cp_submit", "cp_tex",
                                               "n_tex",   "n_batch",  "n_skip",    "cp_wrm",
                                               "cp_wrm_slp", "n_wrm", "n_draw", "n_rp",
-                                              "n_bar",   "n_copy",   "n_disp"};
+                                              "n_bar",   "n_copy",   "n_disp",    "cp_draw",
+                                              "cp_copy", "cp_post",  "cp_exec",   "cp_vbuf",
+                                              "cp_smem", "cp_rpass", "n_cmd",     "n_bind",
+                                              "n_dyn",   "cp_vcmp",  "cp_vval",   "cp_vcpy",
+                                              "n_vpg",   "n_vreq",   "n_vfb"};
 std::atomic<uint64_t> g_cpu_zone_ns[kCpuZones];
 // Interval accumulators for the on-console profile report (switch_perf.cpp). They are summed whether or not
 // the autotest is running, and taken (zeroed) by rex_autotest_take_interval every 10 s.
@@ -142,9 +156,9 @@ extern "C" void rex_take_stage_name(char* out, uint32_t cap) {
 // Profile report (switch_perf.cpp, every 10 s): takes and zeroes the interval accumulators.
 // Layout of out[]: [0] GPU frames measured, [1] GPU busy us, [2] GPU span us, [3..12] GPU us per pass
 // (kGpuPasses = 10: other, draw, rt_xfer, res_clear, dump, resolve, readback, tex_load, upload, swap),
-// [13..27] CPU zones in ns (kCpuZones = 15, same order as kCpuZoneNames; n_* are counts x 1e6).
+// [13..13+kCpuZones-1] CPU zones in ns (same order as kCpuZoneNames; n_* are counts x 1e6). cap must be >= 13 + kCpuZones.
 extern "C" void rex_autotest_take_interval(uint64_t* out, uint32_t cap) {
-  if (out == nullptr || cap < 28) {
+  if (out == nullptr || cap < 13 + kCpuZones) {
     return;
   }
   out[0] = g_iv_gpu_frames.exchange(0, std::memory_order_relaxed);

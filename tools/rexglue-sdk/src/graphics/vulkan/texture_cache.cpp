@@ -20,8 +20,15 @@
 #include <cstdio>
 #include <array>
 #include <cstddef>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/bit.h>
@@ -75,6 +82,15 @@ REXCVAR_DEFINE_BOOL(texture_load_cpu_direct, true, "GPU",
                     "With texture_load_linear_direct: untiled textures whose load is a plain copy "
                     "are host-mapped and filled by the CPU straight from guest memory, each "
                     "reload into a free version of the image (no GPU work for the load)");
+REXCVAR_DEFINE_INT32(texture_cpu_copy_worker_core, -1, "GPU",
+                     "texture_load_cpu_direct: run the row copies on a worker thread pinned to "
+                     "this core (0-2; -1 = on the command processor thread); the submission waits "
+                     "for them")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(texture_cpu_copy_claim, false, "GPU",
+                    "texture_cpu_copy_worker_core: the game's write barrier copies the overlapping "
+                    "jobs the worker has not started itself instead of waiting for the queue")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(texture_load_cpu_poll, true, "GPU",
                     "With texture_load_cpu_direct: don't upload those textures' guest range to the "
                     "shared memory buffer (no page protection to re-arm); instead compare guest "
@@ -112,6 +128,7 @@ extern "C" void RexResolveStatsTextureLoad(uint32_t base, uint32_t size, uint32_
 // core/autotest.cpp: CPU time per frame for the cp_* zones (3 = cp_tex).
 extern "C" void rex_autotest_cpu_add(uint32_t zone, uint64_t ns);
 #include <chrono>
+#include <switch.h>
 #endif
 
 #if REX_PLATFORM_SWITCH
@@ -578,6 +595,7 @@ const VulkanTextureCache::HostFormatPair VulkanTextureCache::kHostFormatDXT5AUna
     false};
 
 VulkanTextureCache::~VulkanTextureCache() {
+  StopCpuCopyWorker();
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -1545,7 +1563,282 @@ void CopyGuestRowSwapped(uint8_t* dst, const uint8_t* src, uint32_t bytes, xenos
     std::memcpy(dst + i, &value, sizeof(value));
   }
 }
+
+// texture_cpu_copy_worker_core: the row copies of texture_load_cpu_direct run on a worker thread
+// pinned to that core, so the command processor thread goes on with the draw. Before the
+// submission (and before any image is destroyed) FinishCpuCopies waits for the queue and flushes
+// the written ranges on the calling thread (the VMA allocator may be externally synchronized).
+// File-static (one texture cache): textures are destroyed after the cache's own members.
+struct CpuCopyJob {
+  uint8_t* dst;
+  const uint8_t* src;
+  VkDeviceSize dst_row_pitch;
+  uint32_t guest_row_pitch, row_bytes, row_first, row_end;
+  xenos::Endian endian;
+  bool use_bitmap;
+  uint64_t row_bitmap[2048 / 64];
+  VmaAllocation allocation;
+  VkDeviceSize flush_offset, flush_size;
+  // Guest physical address of row 0, and the bytes the job reads,
+  // [src_physical_begin, src_physical_end).
+  uint32_t src_physical_base, src_physical_begin, src_physical_end;
+};
+
+void RunCpuCopyJob(const CpuCopyJob& job) {
+  for (uint32_t y = job.row_first; y < job.row_end; ++y) {
+    if (job.use_bitmap && !(job.row_bitmap[y >> 6] & (UINT64_C(1) << (y & 63)))) {
+      continue;
+    }
+    CopyGuestRowSwapped(job.dst + y * job.dst_row_pitch,
+                        job.src + size_t(y) * job.guest_row_pitch, job.row_bytes, job.endian);
+  }
+}
+
+// (A version where the game copied the rows it was about to overwrite itself, with per-row
+// claims, was much slower: 34-39 fps, 2026-11-11.)
+class CpuCopyWorker {
+ public:
+  explicit CpuCopyWorker(int32_t core) : core_(core) {
+    thread_ = std::thread([this]() { Run(); });
+  }
+  ~CpuCopyWorker() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    work_cv_.notify_one();
+    thread_.join();
+  }
+  void Push(const CpuCopyJob& job) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    done_cv_.wait(lock, [this]() { return pushed_ - completed_ < kRingSize; });
+    ring_[pushed_ % kRingSize] = job;
+    state_[pushed_ % kRingSize].store(kPending, std::memory_order_relaxed);
+    ++pushed_;
+    lock.unlock();
+    work_cv_.notify_one();
+  }
+  void WaitIdle() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    done_cv_.wait(lock, [this]() { return completed_ == pushed_; });
+  }
+  // Waits for the queued jobs that read guest physical [begin, end) (and, the queue being in
+  // order, the ones before them); says whether there was anything to wait for.
+  bool WaitForSourceRange(uint32_t begin, uint32_t end) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    uint64_t last_overlapping = UINT64_MAX;
+    for (uint64_t i = completed_; i < pushed_; ++i) {
+      const CpuCopyJob& job = ring_[i % kRingSize];
+      if (job.src_physical_begin < end && begin < job.src_physical_end) {
+        last_overlapping = i;
+      }
+    }
+    if (last_overlapping == UINT64_MAX) {
+      return false;
+    }
+    done_cv_.wait(lock, [this, last_overlapping]() { return completed_ > last_overlapping; });
+    return true;
+  }
+  // texture_cpu_copy_claim: like WaitForSourceRange, but the calling thread claims the overlapping
+  // jobs the worker has not started (and, before each, the pending earlier jobs writing the same
+  // allocation range, so the later copy still wins) and copies them itself; it waits only for the
+  // ones the worker is running.
+  bool ClaimSourceRange(uint32_t begin, uint32_t end) {
+    uint64_t claimed[kRingSize];
+    uint32_t claimed_count = 0;
+    uint64_t waiting[kRingSize];
+    uint32_t waiting_count = 0;
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (uint64_t i = completed_; i < pushed_; ++i) {
+      const CpuCopyJob& job = ring_[i % kRingSize];
+      if (!(job.src_physical_begin < end && begin < job.src_physical_end)) {
+        continue;
+      }
+      // Earlier pending jobs writing the same destination go first.
+      for (uint64_t j = completed_; j < i; ++j) {
+        const CpuCopyJob& prev = ring_[j % kRingSize];
+        if (prev.allocation == job.allocation && prev.flush_offset < job.flush_offset + job.flush_size &&
+            job.flush_offset < prev.flush_offset + prev.flush_size) {
+          ClaimOrWait(j, claimed, claimed_count, waiting, waiting_count);
+        }
+      }
+      ClaimOrWait(i, claimed, claimed_count, waiting, waiting_count);
+    }
+    if (!claimed_count && !waiting_count) {
+      return false;
+    }
+    // First the jobs the worker is running (they may write the destination of a claimed one; they
+    // never wait for the claimed ones, so this cannot deadlock).
+    for (uint32_t k = 0; k < waiting_count; ++k) {
+      const uint64_t i = waiting[k];
+      done_cv_.wait(lock, [this, i]() {
+        return completed_ > i || state_[i % kRingSize].load(std::memory_order_acquire) == kDone;
+      });
+    }
+    if (claimed_count) {
+      lock.unlock();
+      // The slots stay untouched: completed_ cannot pass a job that is not done.
+      for (uint32_t k = 0; k < claimed_count; ++k) {
+        RunCpuCopyJob(ring_[claimed[k] % kRingSize]);
+      }
+      lock.lock();
+      for (uint32_t k = 0; k < claimed_count; ++k) {
+        state_[claimed[k] % kRingSize].store(kDone, std::memory_order_release);
+      }
+      done_cv_.notify_all();
+    }
+    return true;
+  }
+
+ private:
+  static constexpr uint64_t kRingSize = 64;
+  enum : uint8_t { kPending, kRunning, kDone };
+  // With mutex_ held.
+  void ClaimOrWait(uint64_t i, uint64_t* claimed, uint32_t& claimed_count, uint64_t* waiting,
+                   uint32_t& waiting_count) {
+    for (uint32_t k = 0; k < claimed_count; ++k) {
+      if (claimed[k] == i) return;
+    }
+    for (uint32_t k = 0; k < waiting_count; ++k) {
+      if (waiting[k] == i) return;
+    }
+    uint8_t expected = kPending;
+    if (state_[i % kRingSize].compare_exchange_strong(expected, kRunning,
+                                                      std::memory_order_acq_rel)) {
+      claimed[claimed_count++] = i;
+    } else if (expected == kRunning) {
+      waiting[waiting_count++] = i;
+    }
+  }
+  void Run() {
+#if REX_PLATFORM_SWITCH
+    if (core_ >= 0 && core_ <= 2) {
+      svcSetThreadCoreMask(CUR_THREAD_HANDLE, core_, UINT64_C(1) << core_);
+    }
+#endif
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (;;) {
+      work_cv_.wait(lock, [this]() { return stop_ || started_ < pushed_; });
+      if (started_ == pushed_) {
+        return;  // stop_ with nothing left.
+      }
+      const uint64_t index = started_;
+      const CpuCopyJob& job = ring_[index % kRingSize];
+      ++started_;
+      uint8_t expected = kPending;
+      if (state_[index % kRingSize].compare_exchange_strong(expected, kRunning,
+                                                            std::memory_order_acq_rel)) {
+        lock.unlock();
+        // The slot stays untouched until completed_ passes it (Push waits on completed_).
+        RunCpuCopyJob(job);
+        lock.lock();
+        state_[index % kRingSize].store(kDone, std::memory_order_release);
+      } else {
+        // Claimed by the game thread (ClaimSourceRange): completed_ stays in order.
+        done_cv_.wait(lock, [this, index]() {
+          return state_[index % kRingSize].load(std::memory_order_acquire) == kDone;
+        });
+      }
+      ++completed_;
+      done_cv_.notify_all();
+    }
+  }
+  int32_t core_;
+  std::thread thread_;
+  std::mutex mutex_;
+  std::condition_variable work_cv_, done_cv_;
+  std::array<CpuCopyJob, kRingSize> ring_;
+  std::array<std::atomic<uint8_t>, kRingSize> state_{};
+  uint64_t pushed_ = 0, started_ = 0, completed_ = 0;
+  bool stop_ = false;
+};
+
+struct CpuCopyFlush {
+  VmaAllocation allocation;
+  VkDeviceSize offset, size;
+};
+std::unique_ptr<CpuCopyWorker> g_cpu_copy_worker;
+std::vector<CpuCopyFlush> g_cpu_copy_flushes;
+bool g_cpu_copy_worker_checked = false;
+
+bool CpuCopyWorkerEnabled() {
+  if (!g_cpu_copy_worker_checked) {
+    g_cpu_copy_worker_checked = true;
+    const int32_t core = REXCVAR_GET(texture_cpu_copy_worker_core);
+    if (core >= 0) {
+      g_cpu_copy_worker = std::make_unique<CpuCopyWorker>(core);
+      std::printf("[cpu] copy worker on core %d\n", int(core));
+    }
+  }
+  return g_cpu_copy_worker != nullptr;
+}
+
+void PushCpuCopy(const CpuCopyJob& job) {
+  g_cpu_copy_flushes.push_back({job.allocation, job.flush_offset, job.flush_size});
+  g_cpu_copy_worker->Push(job);
+}
+// Game-thread waits in rex_texture_cpu_copy_barrier (count, ns), printed with the [cpu] stats.
+std::atomic<uint64_t> g_cpu_copy_barrier_waits{0}, g_cpu_copy_barrier_ns{0};
 }  // namespace
+
+void VulkanTextureCache::FinishCpuCopies() const {
+  if (!g_cpu_copy_worker || g_cpu_copy_flushes.empty()) {
+    return;
+  }
+#if REX_PLATFORM_SWITCH
+  const auto wait_start = std::chrono::steady_clock::now();
+#endif
+  g_cpu_copy_worker->WaitIdle();
+  for (const CpuCopyFlush& flush : g_cpu_copy_flushes) {
+    vmaFlushAllocation(vma_allocator_, flush.allocation, flush.offset, flush.size);
+  }
+  g_cpu_copy_flushes.clear();
+#if REX_PLATFORM_SWITCH
+  // Part of cp_copy (zone 16): what the worker could not hide.
+  rex_autotest_cpu_add(16, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - wait_start)
+                                        .count()));
+#endif
+}
+
+void VulkanTextureCache::StopCpuCopyWorker() {
+  FinishCpuCopies();
+  g_cpu_copy_worker.reset();
+}
+
+}  // namespace rex::graphics::vulkan
+
+// Called by the game's memcpy hook (texture_write_hook.cpp) before it changes the bytes of a
+// polled texture: the worker may still be copying the old data out of that guest memory (the
+// command processor already went on and the game saw it), so finish the queued copies first.
+// Without this, sprites came out mixed with the next ones (2026-11-11). Only the jobs whose guest
+// source overlaps the write are waited for (waiting for the whole queue cost the game ~0,75 ms
+// per frame).
+extern "C" uint32_t rex_texture_guest_physical(uint32_t guest_address);  // pipeline/texture/cache.cpp
+extern "C" void rex_texture_cpu_copy_barrier(uint32_t guest_address, uint32_t size) {
+  using namespace rex::graphics::vulkan;
+  CpuCopyWorker* worker = g_cpu_copy_worker.get();
+  if (!worker || !size) {
+    return;
+  }
+  const uint32_t physical = rex_texture_guest_physical(guest_address);
+  // Unknown address: wait for everything queued.
+  const uint32_t begin = physical == UINT32_MAX ? 0 : physical;
+  const uint32_t end =
+      physical == UINT32_MAX ? UINT32_MAX : uint32_t(std::min<uint64_t>(uint64_t(physical) + size, UINT32_MAX));
+  const auto start = std::chrono::steady_clock::now();
+  static const bool claim = REXCVAR_GET(texture_cpu_copy_claim);
+  if (claim ? worker->ClaimSourceRange(begin, end) : worker->WaitForSourceRange(begin, end)) {
+    g_cpu_copy_barrier_waits.fetch_add(1, std::memory_order_relaxed);
+    g_cpu_copy_barrier_ns.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count()),
+        std::memory_order_relaxed);
+  }
+}
+
+namespace rex::graphics::vulkan {
 
 bool VulkanTextureCache::LoadsBaseWithoutSharedMemory(const Texture& texture) const {
   // Without the upload the shared memory doesn't protect the pages and the texture's watch never
@@ -1738,21 +2031,65 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
     rows.end = partial ? partial_base_load_row_first_ + partial_base_load_row_count_ : height;
     vulkan_texture.cpu_gen = new_gen;
   }
+#if REX_PLATFORM_SWITCH
+  const auto copy_start = std::chrono::steady_clock::now();
+#endif
   uint8_t* dst = vulkan_texture.cpu_mapped() + vulkan_texture.cpu_offset();
   VkDeviceSize dst_row_pitch = vulkan_texture.cpu_row_pitch();
   uint32_t rows_copied = 0;
-  for (uint32_t y = row_first; y < row_end; ++y) {
-    if (use_bitmap && !(row_bitmap[y >> 6] & (UINT64_C(1) << (y & 63)))) {
-      continue;
+  const VkDeviceSize flush_offset =
+      vulkan_texture.cpu_offset() + VkDeviceSize(row_first) * dst_row_pitch;
+  const VkDeviceSize flush_size = VkDeviceSize(row_end - row_first) * dst_row_pitch;
+  if (CpuCopyWorkerEnabled()) {
+    // texture_cpu_copy_worker_core: the copy runs on the worker; FinishCpuCopies (before the
+    // submission and before any image is destroyed) waits for it and flushes the range.
+    CpuCopyJob job;
+    job.dst = dst;
+    job.src = src;
+    job.dst_row_pitch = dst_row_pitch;
+    job.guest_row_pitch = guest_row_pitch;
+    job.row_bytes = row_bytes;
+    job.row_first = row_first;
+    job.row_end = row_end;
+    const uint32_t src_physical = uint32_t(key.base_page) << 12;
+    job.src_physical_base = src_physical;
+    job.src_physical_begin = src_physical + row_first * guest_row_pitch;
+    job.src_physical_end =
+        row_end > row_first ? src_physical + (row_end - 1) * guest_row_pitch + row_bytes
+                            : job.src_physical_begin;
+    job.endian = endian;
+    job.use_bitmap = use_bitmap;
+    if (use_bitmap) {
+      std::memcpy(job.row_bitmap, row_bitmap, sizeof(uint64_t) * ((height + 63) / 64));
+      for (uint32_t w = row_first >> 6; w < (row_end + 63) >> 6; ++w) {
+        rows_copied += uint32_t(__builtin_popcountll(row_bitmap[w]));
+      }
+    } else {
+      rows_copied = row_end - row_first;
     }
-    CopyGuestRowSwapped(dst + y * dst_row_pitch, src + size_t(y) * guest_row_pitch, row_bytes,
-                        endian);
-    ++rows_copied;
+    job.allocation = vulkan_texture.allocation();
+    job.flush_offset = flush_offset;
+    job.flush_size = flush_size;
+    PushCpuCopy(job);
+  } else {
+    for (uint32_t y = row_first; y < row_end; ++y) {
+      if (use_bitmap && !(row_bitmap[y >> 6] & (UINT64_C(1) << (y & 63)))) {
+        continue;
+      }
+      CopyGuestRowSwapped(dst + y * dst_row_pitch, src + size_t(y) * guest_row_pitch, row_bytes,
+                          endian);
+      ++rows_copied;
+    }
+    // Only the rows written (cached memory: the flush cleans the CPU cache over the range).
+    vmaFlushAllocation(vma_allocator_, vulkan_texture.allocation(), flush_offset, flush_size);
   }
-  // Only the rows written (cached memory: the flush cleans the CPU cache over the range).
-  vmaFlushAllocation(vma_allocator_, vulkan_texture.allocation(),
-                     vulkan_texture.cpu_offset() + VkDeviceSize(row_first) * dst_row_pitch,
-                     VkDeviceSize(row_end - row_first) * dst_row_pitch);
+#if REX_PLATFORM_SWITCH
+  // cp_copy (zone 16): the row copies + flush alone, part of cp_tex (with the worker: the
+  // queueing here plus the waits in FinishCpuCopies).
+  rex_autotest_cpu_add(16, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - copy_start)
+                                         .count()));
+#endif
   if (needs_transition) {
     // Host writes before the submission are visible to it; a reused version is already in the
     // sampled layout (LINEAR, so the host writing it there is fine on NVK).
@@ -1784,6 +2121,12 @@ bool VulkanTextureCache::LoadTextureCpuDirect(Texture& texture, LoadShaderIndex 
     std::printf("[cpu] %u loads (%llu MB), %u in place, %u fallbacks, %u versions created\n",
                 cpu_loads, (unsigned long long)(cpu_bytes >> 20), cpu_in_place, cpu_fallbacks,
                 cpu_versions_created);
+    if (g_cpu_copy_worker) {
+      std::printf("[cpu] game waited for the copy worker %llu times, %llu us total\n",
+                  (unsigned long long)g_cpu_copy_barrier_waits.load(std::memory_order_relaxed),
+                  (unsigned long long)(g_cpu_copy_barrier_ns.load(std::memory_order_relaxed) /
+                                       1000));
+    }
     for (uint32_t l = 0; l < 2; ++l) {
       for (uint32_t t = 0; t < 2; ++t) {
         for (uint32_t g = 0; g < 2; ++g) {
@@ -3241,6 +3584,8 @@ VulkanTextureCache::VulkanTexture::VulkanTexture(VulkanTextureCache& texture_cac
 VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   const VulkanTextureCache& vulkan_texture_cache =
       static_cast<const VulkanTextureCache&>(texture_cache());
+  // A queued CPU copy may still write one of this texture's versions.
+  vulkan_texture_cache.FinishCpuCopies();
   const ui::vulkan::VulkanDevice* const vulkan_device =
       vulkan_texture_cache.command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();

@@ -28,6 +28,10 @@
 
 namespace rex::graphics {
 
+// Low 32 bits of the hash of the EPX filter pixel shader (cvar
+// spirv_ps_epx_hash), 0 = disabled.
+int32_t g_spirv_ps_epx_hash = 0;
+
 SpirvShaderTranslator::Features::Features(bool all)
     : spirv_version(all ? spv::Spv_1_5 : spv::Spv_1_0),
       max_storage_buffer_range(all ? UINT32_MAX : (128 * 1024 * 1024)),
@@ -178,6 +182,9 @@ void SpirvShaderTranslator::StartTranslation() {
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);
+  epx_mode_ = is_pixel_shader() && g_spirv_ps_epx_hash != 0 &&
+              int32_t(uint32_t(current_shader().ucode_data_hash())) == g_spirv_ps_epx_hash;
+  epx_emitted_ = false;
   if (features_.spirv_version < spv::Spv_1_4) {
     if (features_.signed_zero_inf_nan_preserve_float32 || features_.denorm_flush_to_zero_float32 ||
         features_.rounding_mode_rte_float32) {
@@ -1321,10 +1328,97 @@ void SpirvShaderTranslator::ProcessLabel(uint32_t cf_index) {
 }
 
 void SpirvShaderTranslator::ProcessExecInstructionBegin(const ParsedExecInstruction& instr) {
+  if (epx_mode_) {
+    // All fetches run unconditionally, the selection logic is emitted at the end.
+    UpdateExecConditionals(ParsedExecInstruction::Type::kUnconditional, 0, false);
+    return;
+  }
   UpdateExecConditionals(instr.type, instr.bool_constant_index, instr.condition);
 }
 
+void SpirvShaderTranslator::EmitEpxBody() {
+  // Guest registers after the fetches: r6 = E (center), r10 = A (up-left),
+  // r3 = C (up-right), r9 = G (down-left), r8 = I (down-right) stored as xyzw;
+  // r5 = D (left), r7 = F (right), r4 = B (up), r2 = H (down) stored as wxyz.
+  // r1 = interpolated color. Equivalent of the guest's predicated code:
+  //   res = E
+  //   if (E != A && D == A && A == B) res = A
+  //   if (E != C && F == C && C == B) res = C
+  //   if (E != G && D == G && G == H) res = G
+  //   if (E != I && H == I && I == F) res = I
+  //   if (D.a == 0 && E.a == 0 && F.a == 0) res = E
+  //   oC0 = res * r1
+  EnsureBuildPointAvailable();
+  auto load_reg = [&](uint32_t index, bool rotated) -> spv::Id {
+    std::vector<spv::Id> chain;
+    chain.push_back(builder_->makeIntConstant(int(index)));
+    spv::Id value = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_, chain),
+        spv::NoPrecision);
+    if (rotated) {
+      std::vector<unsigned int> swizzle = {1, 2, 3, 0};
+      value = builder_->createRvalueSwizzle(spv::NoPrecision, type_float4_, value, swizzle);
+    }
+    return value;
+  };
+  spv::Id e = load_reg(6, false), a = load_reg(10, false), c = load_reg(3, false);
+  spv::Id g = load_reg(9, false), i = load_reg(8, false);
+  spv::Id d = load_reg(5, true), f = load_reg(7, true), b = load_reg(4, true);
+  spv::Id h = load_reg(2, true);
+  spv::Id color = load_reg(1, false);
+  spv::Id type_bool4 = type_bool_vectors_[3];
+  auto eq = [&](spv::Id x, spv::Id y) -> spv::Id {
+    return builder_->createUnaryOp(spv::OpAll, type_bool_,
+                                   builder_->createBinOp(spv::OpFOrdEqual, type_bool4, x, y));
+  };
+  auto land = [&](spv::Id x, spv::Id y) -> spv::Id {
+    return builder_->createBinOp(spv::OpLogicalAnd, type_bool_, x, y);
+  };
+  auto choose = [&](spv::Id condition, spv::Id if_true, spv::Id if_false) -> spv::Id {
+    std::vector<spv::Id> parts(4, condition);
+    spv::Id condition4 = builder_->createCompositeConstruct(type_bool4, parts);
+    return builder_->createTriOp(spv::OpSelect, type_float4_, condition4, if_true, if_false);
+  };
+  auto corner = [&](spv::Id res, spv::Id corner_value, spv::Id side_0, spv::Id side_1) {
+    spv::Id condition =
+        land(builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, eq(e, corner_value)),
+             land(eq(side_0, corner_value), eq(corner_value, side_1)));
+    return choose(condition, corner_value, res);
+  };
+  spv::Id res = e;
+  res = corner(res, a, d, b);
+  res = corner(res, c, f, b);
+  res = corner(res, g, d, h);
+  res = corner(res, i, h, f);
+  auto alpha_zero = [&](spv::Id v) -> spv::Id {
+    return builder_->createBinOp(spv::OpFOrdEqual, type_bool_,
+                                 builder_->createCompositeExtract(v, type_float_, 3),
+                                 const_float_0_);
+  };
+  spv::Id row_transparent = land(alpha_zero(d), land(alpha_zero(e), alpha_zero(f)));
+  res = choose(row_transparent, e, res);
+  spv::Id out = builder_->createNoContractionBinOp(spv::OpFMul, type_float4_, res, color);
+  if (output_or_var_fragment_data_[0] != spv::NoResult) {
+    builder_->createStore(out, output_or_var_fragment_data_[0]);
+  }
+}
+
 void SpirvShaderTranslator::ProcessExecInstructionEnd(const ParsedExecInstruction& instr) {
+  if (epx_mode_) {
+    if (instr.is_end) {
+      CloseInstructionPredication();
+      if (!epx_emitted_) {
+        epx_emitted_ = true;
+        EmitEpxBody();
+      }
+      if (!builder_->getBuildPoint()->isTerminated()) {
+        builder_->createBranch(current_shader().label_addresses().empty() ? main_loop_merge_
+                                                                          : main_switch_merge_);
+      }
+    }
+    UpdateExecConditionals(ParsedExecInstruction::Type::kUnconditional, 0, false);
+    return;
+  }
   if (instr.is_end) {
     // Break out of the main switch (if exists) and the main loop.
     CloseInstructionPredication();

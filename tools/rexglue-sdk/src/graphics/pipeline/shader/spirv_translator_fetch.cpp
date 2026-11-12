@@ -24,6 +24,9 @@
 
 namespace rex::graphics {
 
+// Set by the Vulkan command processor from the spirv_ps_implicit_lod cvar.
+bool g_spirv_ps_implicit_lod = false;
+
 void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
   UpdateInstructionPredication(instr.is_predicated, instr.predicate_condition);
@@ -485,7 +488,7 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
 
 void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     const ParsedTextureFetchInstruction& instr) {
-  UpdateInstructionPredication(instr.is_predicated, instr.predicate_condition);
+  UpdateInstructionPredication(instr.is_predicated && !epx_mode_, instr.predicate_condition);
 
   EnsureBuildPointAvailable();
 
@@ -1310,10 +1313,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       // All 32 bits containing the values for 4 fetch constants (use
       // OpBitFieldUExtract to get the signednesses for the specific components
       // of this texture).
-      spv::Id swizzled_signs_word = builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                      id_vector_temp_),
-          spv::NoPrecision);
+      const Modification::PixelShaderModification static_pixel =
+          GetSpirvShaderModification().pixel;
+      // All signs kUnsigned (0) baked in: constant-folded by the host compiler.
+      spv::Id swizzled_signs_word =
+          (is_pixel_shader() && static_pixel.static_state && fetch_constant_index < 2 &&
+           (static_pixel.static_fetch_unsigned_mask & (1u << fetch_constant_index)))
+              ? const_uint_0_
+              : builder_->createLoad(
+                    builder_->createAccessChain(spv::StorageClassUniform,
+                                                uniform_system_constants_, id_vector_temp_),
+                    spv::NoPrecision);
       uint32_t swizzled_signs_word_offset = 8 * (fetch_constant_index & 3);
 
       spv::Builder::TextureParameters texture_parameters = {};
@@ -1866,7 +1876,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           sample_result_signed =
               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
         } else {
-          if (use_computed_lod) {
+          if (use_computed_lod && g_spirv_ps_implicit_lod && is_pixel_shader() &&
+              !instr.attributes.use_register_gradients &&
+              instr.dimension == xenos::FetchOpDimension::k2D) {
+            // Experiment: implicit LOD + bias instead of textureGrad with
+            // computed coarse derivatives (TXD is slow on Maxwell).
+            image_operands_mask = spv::ImageOperandsBiasMask;
+            texture_parameters.bias = lod;
+          } else if (use_computed_lod) {
             texture_parameters.gradX = gradients_h;
             texture_parameters.gradY = gradients_v;
           }

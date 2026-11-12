@@ -22,9 +22,16 @@
 
 namespace rex::graphics {
 
+// Experiment (cvar spirv_ps_ieee_mul): pixel shaders use plain IEEE
+// multiplication, without the Shader Model 3 "0 * anything = 0" selection.
+bool g_spirv_ps_ieee_mul = false;
+
 spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs,
                                                       spv::Id operand_1_abs) {
   EnsureBuildPointAvailable();
+  if (g_spirv_ps_ieee_mul && is_pixel_shader()) {
+    return value;
+  }
   int num_components = builder_->getNumComponents(value);
   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
   assert_true(builder_->getNumComponents(operand_1_abs) == num_components);
@@ -57,8 +64,9 @@ void SpirvShaderTranslator::KillPixel(spv::Id condition,
 
 void SpirvShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& instr,
                                                   uint8_t memexport_eM_potentially_written_before) {
-  if (instr.IsNop()) {
-    // Don't even disassemble or update predication.
+  if (instr.IsNop() || epx_mode_) {
+    // Don't even disassemble or update predication. In the EPX filter mode, the
+    // ALU code is replaced by EmitEpxBody.
     return;
   }
 
@@ -192,7 +200,7 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
       uint32_t multiplicands_different =
           used_result_components &
           ~instr.vector_operands[0].GetIdenticalComponents(instr.vector_operands[1]);
-      if (multiplicands_different) {
+      if (multiplicands_different && !(g_spirv_ps_ieee_mul && is_pixel_shader())) {
         // Shader Model 3: +0 or denormal * anything = +-0.
         spv::Id different_operands[2] = {multiplicands[0], multiplicands[1]};
         spv::Id different_result = result;

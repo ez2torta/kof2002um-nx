@@ -143,7 +143,7 @@ static uint64_t at__now_ns(void) {
 }
 #endif
 
-#define AT__MAX_ZONES   32
+#define AT__MAX_ZONES   48
 #define AT__ZONE_NAME   32
 #define AT__FLUSH_EVERY 32   /* frames de perf por envío */
 

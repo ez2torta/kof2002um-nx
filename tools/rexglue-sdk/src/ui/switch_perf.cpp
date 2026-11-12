@@ -565,8 +565,8 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
   // Where a frame goes (averages over the interval): GPU time by pass from the timestamp probe
   // (gpu_submission_timestamps) and the command-processor thread's CPU zones.
   {
-    uint64_t v[28] = {};
-    rex_autotest_take_interval(v, 28);
+    uint64_t v[64] = {};
+    rex_autotest_take_interval(v, 64);
     const double gf = double(v[0]);
     const double pf = double(counters_now[0] - counters_last[0]);
     if (gf > 0.0) {

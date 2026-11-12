@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <set>
@@ -36,6 +37,7 @@
 #include <rex/graphics/pipeline_util.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -59,6 +61,14 @@ REXCVAR_DEFINE_INT32(
     .range(-1, 32)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(spirv_ps_static_state, false, "GPU/Vulkan",
+                    "Experiment: bake alpha test function, RT0 gamma and fetch 0/1 "
+                    "all-unsigned signs into the pixel shader modification")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(spirv_no_sample_mask_output, false, "GPU/Vulkan",
+                    "Experiment: translate pixel shaders without the gl_SampleMask output "
+                    "(drops alpha to coverage emulation)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -302,8 +312,16 @@ bool VulkanPipelineCache::Initialize() {
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
+  SpirvShaderTranslator::Features translator_features(vulkan_device);
+  if (REXCVAR_GET(spirv_no_sample_mask_output)) {
+    // Experiment: no gl_SampleMask output (alpha to coverage emulation) in pixel shaders.
+    translator_features.sample_rate_shading = false;
+  }
+  printf("[spvexp] sample_rate_shading=%d demote=%d\n",
+         int(translator_features.sample_rate_shading),
+         int(translator_features.demote_to_helper_invocation));
   shader_translator_ = std::make_unique<SpirvShaderTranslator>(
-      SpirvShaderTranslator::Features(vulkan_device),
+      translator_features,
       render_target_cache_.msaa_2x_attachments_supported(),
       render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
       render_target_cache_.draw_resolution_scale_x(),
@@ -1025,6 +1043,28 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
       }
     }
+  }
+
+  if (REXCVAR_GET(spirv_ps_static_state) &&
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+    // Bake the render state that the translator otherwise reads from the system
+    // constants, so the host compiler can fold the dynamic branches away.
+    auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+    modification.pixel.static_state = 1;
+    modification.pixel.static_alpha_test_function = uint32_t(
+        rb_colorcontrol.alpha_test_enable ? rb_colorcontrol.alpha_func
+                                          : xenos::CompareFunction::kAlways);
+    modification.pixel.static_color0_no_gamma =
+        render_target_cache_.gamma_render_target_as_unorm16() ||
+        regs.Get<reg::RB_COLOR_INFO>().color_format !=
+            xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA;
+    uint32_t fetch_unsigned_mask = 0;
+    for (uint32_t i = 0; i < 2; ++i) {
+      if (texture_util::SwizzleSigns(regs.GetTextureFetch(i)) == 0) {
+        fetch_unsigned_mask |= 1u << i;
+      }
+    }
+    modification.pixel.static_fetch_unsigned_mask = fetch_unsigned_mask;
   }
 
   return modification;
