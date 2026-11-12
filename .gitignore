@@ -42,3 +42,4 @@ __pycache__/
 
 # --- Docker build ----------------------------------------------------------------
 tools/mesa-switch-sdk/
+tools/mesa-switch-src/

@@ -1,5 +1,6 @@
 # docker compose build            -> construye la imagen del toolchain
 # docker compose run --rm codegen  -> compila el rexglue del SDK del repo y hace el codegen de default.xex (Debian 13)
+# docker compose run --rm mesa     -> compila Mesa/NVK (mesa-switch + parche de nfsmw-nx) en tools/mesa-switch-sdk
 # docker compose run --rm nx       -> fetch + configure + build (deja kof2002um-nx.nro en la raíz del repo)
 # docker compose run --rm nx fetch | configure | build | shell
 services:
@@ -17,6 +18,17 @@ services:
       - .:/work
       - ./docker/build.sh:/usr/local/bin/kof-build:ro
       - ${GAME_DIR:-/media/sda1/Games/x360recomp/extracted/kof2002um}:/game:ro
+  mesa:
+    # Mesa/NVK estático -> tools/mesa-switch-sdk. Necesita ~16 GB de RAM recomendados; baja JOBS si se queda sin memoria.
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mesa
+    image: kof2002um-nx-mesa:latest
+    environment:
+      JOBS: ${JOBS:-3}
+    volumes:
+      - .:/work
+      - ./docker/build-mesa.sh:/usr/local/bin/build-mesa:ro
   nx:
     build:
       context: .
