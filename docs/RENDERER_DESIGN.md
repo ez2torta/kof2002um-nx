@@ -183,4 +183,4 @@ Resuelto con la corrida del 2026-11-12 (detalle en `docs/RENDER_PERF_PLAN.md`, �
 Sigue pendiente:
 
 - Colores de vértice de las copias teñidas (`7ABD`), para saber cuáles son la identidad y se pueden eliminar directamente.
-- Disassembly de los shaders D3D9 del exe de PC (`tools/perf/` pendiente) para nombrar los parámetros de los shaders del 360 (ver `docs/RENDER_PERF_PLAN.md`, §3.9).
+- (Hecho) Desensamblado de los shaders D3D9 del exe de PC: los sprites coinciden; el filtro es solo del 360 y elige un píxel existente por igualdad de vecinos (`docs/RENDER_PERF_PLAN.md`, §3.9).

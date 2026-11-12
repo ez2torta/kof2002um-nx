@@ -264,20 +264,29 @@ GPU: ~0,1 ms de CPU por draw. Pendiente: perfil de pila del hilo de comandos dur
 ### 3.9 Shaders del exe de PC (identificación)
 
 `kof02um_decomp` desempaqueta el exe de Steam (`tools/steamstub/unpack_steamstub30.py`, vía `scripts/bootstrap.sh`; resultado en
-`kof02um_decomp/build/KingOfFighters2002UM_unpacked.exe`). Un escaneo de tokens de versión D3D9 (`0xFFFF0200`, `0xFFFE0200`,
-`0xFFFF0300`, `0xFFFE0300`) y token de fin (`0x0000FFFF`) halla **23 shaders compilados**: 12 `ps_2_0`, 7 `vs_2_0`, 2 `ps_3_0` y 2 `vs_3_0`,
-con su tabla de constantes (CTAB) y parámetros con nombre:
+`kof02um_decomp/build/KingOfFighters2002UM_unpacked.exe`). `tools/perf/d3d9dis.py` escanea ese exe, halla **23 shaders D3D9
+compilados** (12 `ps_2_0`, 7 `vs_2_0`, 2 `ps_3_0`, 2 `vs_3_0`) y los desensambla con los nombres de la tabla de constantes (CTAB):
 
-| Shader PC | Tamaño | Parámetros (CTAB) | Probable equivalente en el 360 |
+| Shader PC (offset en el exe) | Instr. / `texld` | Parámetros | Equivalente en el 360 |
 |---|---|---|---|
-| `ps_2_0` @0x3d3f8, @0x3d568, @0x3ef78 | 364–388 B | `IndexTexture`, `PaletteTexture` | sprites indexados + paleta (`ps36D6`, `ps6082`, `ps03B1`, `ps7238`) |
-| `ps_2_0` @0x43348 | 456 B | `PictureTex`, `Palette` | variante con paleta |
-| **`ps_3_0` @0x403f8** | **9808 B** | `ConstColor` | filtro de pixel art (`psD104`, 314 líneas de desensamblado) |
-| `ps_3_0` @0x3f2b8 | 4052 B | `ConstColor` | variante más ligera del filtro |
-| `vs_3_0` @0x3f150, @0x40290 | 356 B | `transform` | vértice de los quads |
+| `ps_2_0` @0x330858, @0x342c08 | 6 / 1 | `Texture` | copia texturizada |
+| `ps_2_0` @0x33d330 | 4 / 1 | `MyTexture` | copia simple (`texld` + `mov`); el `7ABD` del 360 además multiplica por el color del vértice |
+| `ps_2_0` @0x33d3f8, @0x33d568, @0x33d6f0, @0x33ef78, @0x342d90 | 9–12 / 2 | `IndexTexture`, `PaletteTexture` | **sprites indexados** (`ps36D6`, `ps6082`, `ps03B1`, `ps7238`): mismo cálculo |
+| `ps_2_0` @0x343210, @0x343348 | 9–13 / 2 | `Palette`, `PictureTex` (+ `bg_color`, `pal_mod`) | fondos con paleta modulable |
+| `ps_3_0` @0x3403f8 (9808 B), @0x33f2b8 (4052 B) | 514 y 219 / **0** | `ConstColor` (68 constantes) | **no es el filtro**: no leen texturas; calculan un índice a partir de `texcoord0` y eligen un color de una tabla en constantes |
+| `vs_2_0` / `vs_3_0` | 7–14 | `transform` / `mTransform` | vértice de los quads |
 
-(Offsets de archivo del exe desempaquetado.) Falta desensamblar el bytecode D3D9 (formato documentado, instrucciones de 1 token +
-operandos) para comparar el algoritmo con el desensamblado del 360 y nombrar sus constantes.
+Sprites indexados (PC): `i = tex(IndexTexture, uv).x ; color = tex(PaletteTexture, (i * 0.125 + v0.y, v0.x)) ; a = color.a * v0.w`.
+El `ps36D6` del 360 hace lo mismo (índice × constante como coordenada, color de la paleta × alfa del vértice).
+
+**El filtro de pixel art no existe en PC.** Su algoritmo se obtiene del desensamblado del 360 (`psD104`): 9 lecturas (centro y 8
+vecinos), una larga cadena de comparaciones de igualdad con predicados y `cndeq`, y una salida que siempre es **un píxel
+existente (el central `r6` o uno elegido `r10`) multiplicado por el color del vértice**, nunca un promedio. Es una decisión por
+igualdad de vecinos de la familia Scale2x/EPX que limpia diagonales escalonadas. Esto implica que el filtro se puede portar o
+reemplazar con una versión equivalente más barata, comparable contra capturas.
+
+Los volcados completos de los 23 shaders **no se versionan** (material derivado del juego comercial); se regeneran con
+`python3 -I tools/perf/d3d9dis.py <exe_desempaquetado> <carpeta>`.
 
 Herramientas de extracción del decompilado, útiles para identificar lo que falte: `tools/steamstub/` (desempaquetar el exe),
 `tools/xbox360/` (`stfs_extract.py`, `xcompress_extract.py`, `d3d_surface.py`, `xzp_png_to_dds.py`), `tools/bg_bin/` (inspección y
