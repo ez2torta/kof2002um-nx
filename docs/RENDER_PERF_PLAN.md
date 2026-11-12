@@ -197,12 +197,27 @@ stencil dependiera de que el clear lo dejara en cero, se vería una máscara o s
 
 ### 3.8 Medición por etapa (2026-11-12, CPU 1428 / GPU 614,4 / memoria 1331)
 
+**Qué letra es qué etapa.** Los fondos de pelea del 360 están en `data/B/bg/` (24 archivos). El orden alfabético coincide con el
+orden de las etapas en `strings.txt` (`StageJapan`, `StageKorea1-3`, `StageChina`, …) y con la tabla de selectores que documentó el
+decompilado de PC (`kof02um_decomp/docs/GAME_CODE_MAP.md`, ~l. 99): selector 0 → `BGA0`, 1 → `BGB0/1/2`, 2 → `BGC0`, 3 → `BGD0`,
+4 → `BGE0/…`, 5 → `BGF0/1`, 6 → `BGG0/1/2`, 7 → `BGH0`. Inferido y **coincide con las medidas** (la etapa lenta que reporta el usuario
+es China = `bgc0`; Taiwan = `bgf0` anda a 60 fps; USA = `bgd0`):
+
+| Letra | Etapa | Letra | Etapa |
+|---|---|---|---|
+| `bga0` | Japan | `bgg0/1/2` | Italy-1/2/3 |
+| `bgb0/1/2` | Korea-1/2/3 | `bgh0` | Greece |
+| **`bgc0`** | **China** | `bgi0/1` | NeoGeo World-1/2 (sin confirmar) |
+| `bgd0` | USA | `bgj0/1` | Clone Lab-1/2 (sin confirmar) |
+| `bge0/1` | Cambodia-1/2 | `bgk0, bgm0/1, bgn0, bgo0, bgp0` | Rugal, Krizalid, C-Zero, Zero, Igniz (sin confirmar el reparto) |
+| `bgf0/1` | Taiwan-1/2 | | |
+
 Primera corrida con el fondo de etapa etiquetado (`stage background`), training, 29 ventanas de 10 s:
 
 | Fondo | Ventanas | fps normal | Notas |
 |---|---|---|---|
 | `bgg0.bin` | 4 | 57,7–59,1 | picos de SDM de Kula con 142–248 draws: 39,8 y 51,1 fps |
-| `bgc0.bin` | 14 | **48,3–50,2 sostenidos** | GPU 18,6–19,8 ms con solo 92–103 draws; 75–80 % de frames ≤18 ms. Sería la etapa lenta que reportó el usuario (China); **falta confirmar qué letra es cada etapa** |
+| `bgc0.bin` | 14 | **48,3–50,2 sostenidos** | GPU 18,6–19,8 ms con solo 92–103 draws; 75–80 % de frames ≤18 ms. Es la etapa lenta que reportó el usuario (**China**) |
 | `bgf0.bin` | 8 | 58,3–60,5 (66–72 draws) | picos de SDM con 110–218 draws: 36,7–50,2 fps |
 | `bgd0.bin` | 1+ | 48,6 | 160 draws |
 
@@ -245,6 +260,29 @@ pendiente de aclarar.
 **SDM de Kula** (en Taiwan y en USA): los frames tienen 250–430 draws y la GPU "span" supera a la "ocupada" por 3–8 ms
 (ventana de 275 draws: ocupada 20,7 ms, span 28,7 ms, 16 % de frames ≤18 ms). El límite es el **hilo de comandos** (CPU), no la
 GPU: ~0,1 ms de CPU por draw. Pendiente: perfil de pila del hilo de comandos durante una SDM.
+
+### 3.9 Shaders del exe de PC (identificación)
+
+`kof02um_decomp` desempaqueta el exe de Steam (`tools/steamstub/unpack_steamstub30.py`, vía `scripts/bootstrap.sh`; resultado en
+`kof02um_decomp/build/KingOfFighters2002UM_unpacked.exe`). Un escaneo de tokens de versión D3D9 (`0xFFFF0200`, `0xFFFE0200`,
+`0xFFFF0300`, `0xFFFE0300`) y token de fin (`0x0000FFFF`) halla **23 shaders compilados**: 12 `ps_2_0`, 7 `vs_2_0`, 2 `ps_3_0` y 2 `vs_3_0`,
+con su tabla de constantes (CTAB) y parámetros con nombre:
+
+| Shader PC | Tamaño | Parámetros (CTAB) | Probable equivalente en el 360 |
+|---|---|---|---|
+| `ps_2_0` @0x3d3f8, @0x3d568, @0x3ef78 | 364–388 B | `IndexTexture`, `PaletteTexture` | sprites indexados + paleta (`ps36D6`, `ps6082`, `ps03B1`, `ps7238`) |
+| `ps_2_0` @0x43348 | 456 B | `PictureTex`, `Palette` | variante con paleta |
+| **`ps_3_0` @0x403f8** | **9808 B** | `ConstColor` | filtro de pixel art (`psD104`, 314 líneas de desensamblado) |
+| `ps_3_0` @0x3f2b8 | 4052 B | `ConstColor` | variante más ligera del filtro |
+| `vs_3_0` @0x3f150, @0x40290 | 356 B | `transform` | vértice de los quads |
+
+(Offsets de archivo del exe desempaquetado.) Falta desensamblar el bytecode D3D9 (formato documentado, instrucciones de 1 token +
+operandos) para comparar el algoritmo con el desensamblado del 360 y nombrar sus constantes.
+
+Herramientas de extracción del decompilado, útiles para identificar lo que falte: `tools/steamstub/` (desempaquetar el exe),
+`tools/xbox360/` (`stfs_extract.py`, `xcompress_extract.py`, `d3d_surface.py`, `xzp_png_to_dds.py`), `tools/bg_bin/` (inspección y
+exportación OBJ/GLB de `bg_bin`), `tools/pdata/`, `tools/pe/` (imports), `tools/video/` (WMV → MPEG-1), `tools/audio/` (XSB), y `symbols/*.tsv`.
+Ojo: los fondos de pelea del 360 viven en `data/B/bg/` (formato propio, ~4 MB); `data/bg_bin/` es otro conjunto (HUD y barras: `BGT0`).
 
 ## 4. Estado del código (working tree, sin commitear salvo este documento)
 

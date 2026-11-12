@@ -183,4 +183,4 @@ Resuelto con la corrida del 2026-11-12 (detalle en `docs/RENDER_PERF_PLAN.md`, �
 Sigue pendiente:
 
 - Colores de vértice de las copias teñidas (`7ABD`), para saber cuáles son la identidad y se pueden eliminar directamente.
-- Qué letra de fondo (`bgXn`) corresponde a cada etapa por nombre (China, Taiwan, USA…): confirmar con el usuario.
+- Disassembly de los shaders D3D9 del exe de PC (`tools/perf/` pendiente) para nombrar los parámetros de los shaders del 360 (ver `docs/RENDER_PERF_PLAN.md`, §3.9).
