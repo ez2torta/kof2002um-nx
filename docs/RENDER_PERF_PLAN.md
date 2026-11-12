@@ -195,6 +195,57 @@ stencil dependiera de que el clear lo dejara en cero, se vería una máscara o s
 
 ---
 
+### 3.8 Medición por etapa (2026-11-12, CPU 1428 / GPU 614,4 / memoria 1331)
+
+Primera corrida con el fondo de etapa etiquetado (`stage background`), training, 29 ventanas de 10 s:
+
+| Fondo | Ventanas | fps normal | Notas |
+|---|---|---|---|
+| `bgg0.bin` | 4 | 57,7–59,1 | picos de SDM de Kula con 142–248 draws: 39,8 y 51,1 fps |
+| `bgc0.bin` | 14 | **48,3–50,2 sostenidos** | GPU 18,6–19,8 ms con solo 92–103 draws; 75–80 % de frames ≤18 ms. Sería la etapa lenta que reportó el usuario (China); **falta confirmar qué letra es cada etapa** |
+| `bgf0.bin` | 8 | 58,3–60,5 (66–72 draws) | picos de SDM con 110–218 draws: 36,7–50,2 fps |
+| `bgd0.bin` | 1+ | 48,6 | 160 draws |
+
+**Por qué `bgc0` es más lenta** (ventana de `bgc0` contra ventana de `bgf0`):
+
+| | `bgc0` | `bgf0` |
+|---|---|---|
+| Draws por frame | ~100 | ~71 |
+| GPU ocupada | 19,4 ms | 15,8 ms |
+| Pasadas de composición (`upload`) | 8,85 ms | 6,69 ms |
+| Clears por resolve (`res_clear`) | 1,03 ms | 0,10 ms |
+| Resolves por frame | 11 | 9 |
+| Render passes / barreras | 27 / 46 | 23 / 38 |
+
+La etapa hace una ronda extra de filtro: dos resolves más, ~2 pasadas de composición más y un clear por resolve. La carga de
+texturas va igual en ambas (todo por la carga directa por CPU; la única textura fuera del camino rápido es una `fmt3 128x256`
+lineal, no elegible, 1 por frame). **La hipótesis anterior de que las texturas del fondo caían al camino lento de GPU es falsa
+para estas etapas**: los 51 dispatches y 43 copias de la ventana de la corrida de 1326 MHz no se repitieron.
+
+**Quién empuja las barreras** (por frame, `bgc0`, ~100 draws), resuelto con `addr2line`:
+
+| Llamador | Pushes por frame | Comentario |
+|---|---|---|
+| `VulkanRenderTargetCache::Update` (2 sitios) | 99 + 98 | uno por draw por sitio; casi todos se descartan por `skip_if_equal` |
+| `VulkanTextureCache::ResolveCopyToTextures` (3 sitios) | 11 + 11 + 11 | barreras del blit y las copias del resolve |
+| `VulkanRenderTargetCache::Resolve` | 11 | target → origen de copia |
+| `VulkanTextureCache::RequestTextures` | 11 | textura destino → muestreo |
+| `PerformTransfersAndResolveClears` (2 sitios) | 8 + 8 | clears por resolve |
+| `VulkanTextureCache::FlushTextureLoadBatch` | 1 | |
+
+Las barreras reales que se emiten (46 por frame) vienen sobre todo de los **resolves** (~6–7 pushes por resolve × 11). De los
+render passes cortados por frame, ~20 son por `SubmitBarriers` (barreras pendientes), ~5 por `EndSubmission` y ~2 por cambio de
+framebuffer. Esto confirma la hipótesis del costo fijo por resolve (§3.5).
+
+**Intercambio rojo/azul:** el 100 % de los resolves directos a textura usan el blit con intercambio (`copy_dest_swap`), o sea
+la doble copia (blit a B8G8R8A8 + copia a la textura) en cada uno. Detalle: el contador por frame (45–46) cuenta llamadas con copia
+exitosa, que superan a los resolves (9–11), por lo que cada resolve termina en varias llamadas o varias texturas destino;
+pendiente de aclarar.
+
+**SDM de Kula** (en Taiwan y en USA): los frames tienen 250–430 draws y la GPU "span" supera a la "ocupada" por 3–8 ms
+(ventana de 275 draws: ocupada 20,7 ms, span 28,7 ms, 16 % de frames ≤18 ms). El límite es el **hilo de comandos** (CPU), no la
+GPU: ~0,1 ms de CPU por draw. Pendiente: perfil de pila del hilo de comandos durante una SDM.
+
 ## 4. Estado del código (working tree, sin commitear salvo este documento)
 
 Todo en `tools/rexglue-sdk/` y `switch/kof2002um_nx.toml`.

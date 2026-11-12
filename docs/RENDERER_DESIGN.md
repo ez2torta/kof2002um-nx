@@ -173,7 +173,14 @@ Orden de trabajo de la fase 1, cada paso con el cvar apagado por defecto y verif
 
 ## 9. Lo que falta saber antes de escribir código
 
-- Qué texturas del fondo de China no entran por la carga directa por CPU (el reporte nuevo lista formato, tamaño y si son tiled).
-- Qué código empuja las barreras que cortan los render passes (el reporte nuevo las agrupa por llamador).
-- Cuántos resolves de la cadena llevan el intercambio rojo/azul (contadores nuevos).
+Resuelto con la corrida del 2026-11-12 (detalle en `docs/RENDER_PERF_PLAN.md`, §3.8):
+- El 100 % de los resolves de la cadena usan el blit con intercambio rojo/azul: el *swizzle* de la vista de muestreo sirve.
+- Las barreras que cortan los render passes vienen sobre todo de los resolves (`Resolve`, `ResolveCopyToTextures`, `RequestTextures`,
+  `PerformTransfersAndResolveClears`).
+- Las texturas de los fondos no caen al camino lento de GPU: no hay que ampliar la carga directa para entrar al camino rápido.
+- La etapa más lenta (`bgc0`) añade una ronda extra de filtro (+2 resolves, ~2 pasadas): el target virtual la abarata igual que a las demás.
+
+Sigue pendiente:
+
 - Colores de vértice de las copias teñidas (`7ABD`), para saber cuáles son la identidad y se pueden eliminar directamente.
+- Qué letra de fondo (`bgXn`) corresponde a cada etapa por nombre (China, Taiwan, USA…): confirmar con el usuario.
